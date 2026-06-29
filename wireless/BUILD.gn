@@ -1,0 +1,41 @@
+# Copyright (c) 2026 vivo Mobile Communication Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# BlueOS wireless UAPI crate. Sibling of //kernel/header (blueos_header):
+# kernel-owned ABI contract shared by both the kernel and userspace.
+# Mirrors Linux's include/uapi/linux/wireless.h (+ net/wireless/) and
+# NuttX's include/nuttx/wireless/.
+#
+# 单测:见 src/wext.rs 的 `#[cfg(test)] mod tests`。本仓的 `run_host` 当前不切换
+# host 工具链(直接 ninja 编 --test bin 会在 target 上链接 std 失败,与 infra 同),
+# 故单测暂通过 `cargo test` 在 host 上执行。待 host 测试基建完善后,在此加回
+# `wireless_unittest`(--test)+ `run_host` target,并把 check_wireless 指过去即可。
+
+import("//build/templates/build_template.gni")
+
+# 入口:确保 crate 在 CI 中能编译(no_std rlib + 编译期 const assert)。
+group("check_wireless") {
+  testonly = true
+  deps = [ ":blueos_wireless" ]
+}
+
+# 正式产物:no_std rlib,给内核(net/iface 控制层)和用户态(shell 等)依赖。
+build_rust("blueos_wireless") {
+  crate_type = "rlib"
+  sources = [ "src/lib.rs" ]
+  edition = "2021"
+  configs += [ "//build/boards/${board}:kernel_config" ]
+  cfgs = [ "${build_type}" ]
+  deps = board_deps + [ "//libc" ]
+}
