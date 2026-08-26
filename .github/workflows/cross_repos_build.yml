@@ -1,4 +1,4 @@
-name: Trigger build cross multiple repositories
+name: Trigger build cross multiple repositories (fork test)
 
 on:
   issue_comment:
@@ -6,4 +6,4 @@ on:
 
 jobs:
   call_workflow:
-    uses: vivoblueos/kernel/.github/workflows/reusable_cross_repos_build.yml@main
+    uses: ./.github/workflows/reusable_cross_repos_build.fork.yml
