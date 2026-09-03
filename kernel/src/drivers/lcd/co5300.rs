@@ -65,8 +65,12 @@ where
         &mut self,
         transfer: impl FnOnce(&mut BlockSpi<T, G>) -> crate::drivers::Result<()>,
     ) -> crate::drivers::Result<()> {
+        let mut inner = self.spi.0.lock();
+        inner
+            .configure(&SpiConfig::qspi_display_default())
+            .map_err(|_| crate::error::code::EIO)?;
         self.cs.set_low().map_err(|_| crate::error::code::EIO)?;
-        let result = transfer(&mut self.spi.0.lock());
+        let result = transfer(&mut inner);
         let cs_result = self.cs.set_high().map_err(|_| crate::error::code::EIO);
         result.and(cs_result)
     }
