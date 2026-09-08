@@ -141,6 +141,7 @@ where
     cached_even_row: Option<u16>,
     width: u16,
     height: u16,
+    brightness: u8,
 }
 
 impl<T, G, S> Co5300Lcd<T, G, S>
@@ -178,6 +179,7 @@ where
             cached_even_row: None,
             width,
             height,
+            brightness: 0xFF,
         })
     }
 
@@ -397,6 +399,17 @@ where
             }
         }
         Ok(())
+    }
+
+    fn set_brightness(&mut self, value: u8) -> Result<(), super::LcdError> {
+        let display = &mut self.display;
+        block_on_sync(display.set_brightness(value)).map_err(|_| super::LcdError::Bus)?;
+        self.brightness = value;
+        Ok(())
+    }
+
+    fn brightness(&self) -> Result<u8, super::LcdError> {
+        Ok(self.brightness)
     }
 }
 

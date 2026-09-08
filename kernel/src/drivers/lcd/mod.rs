@@ -14,6 +14,7 @@
 
 use core::sync::atomic::AtomicUsize;
 
+use crate::devices::backlight::{BacklightDevice, BacklightOps};
 use crate::devices::framebuffer::{
     FramebufferBitfield, FramebufferDevice, FramebufferFixedInfo, FramebufferOps,
     FramebufferVariableInfo,
@@ -50,6 +51,18 @@ impl<T: Lcd> LcdFramebuffer<T> {
     }
 }
 
+impl<T: Lcd> BacklightOps for LcdFramebuffer<T> {
+    fn set_brightness(&mut self, value: u8) -> Result<(), embedded_io::ErrorKind> {
+        self.display
+            .set_brightness(value)
+            .map_err(lcd_error_to_io_error)
+    }
+
+    fn brightness(&self) -> Result<u8, embedded_io::ErrorKind> {
+        Lcd::brightness(&self.display).map_err(lcd_error_to_io_error)
+    }
+}
+
 impl<T: Lcd + 'static> LcdFramebuffer<T> {
     fn register_lcd(lcd: T, width: u32, height: u32) -> Result<(), embedded_io::ErrorKind> {
         static INDEX: AtomicUsize = AtomicUsize::new(0);
@@ -58,8 +71,15 @@ impl<T: Lcd + 'static> LcdFramebuffer<T> {
             height,
             display: lcd,
         }));
-        FramebufferDevice::register(INDEX.load(core::sync::atomic::Ordering::Relaxed), fb)?;
+        FramebufferDevice::register(INDEX.load(core::sync::atomic::Ordering::Relaxed), fb.clone())?;
         INDEX.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+
+        // Register the backlight device sharing the same LcdFramebuffer.
+        // Failure here is non-fatal — the framebuffer itself is already usable.
+        if let Err(error) = BacklightDevice::register(fb) {
+            log::warn!("Failed to register backlight device: {:?}", error);
+        }
+
         Ok(())
     }
 }
@@ -198,15 +218,27 @@ pub enum LcdError {
     InvalidArea,
     InvalidColorData,
     Bus,
+    Unsupported,
 }
 
 fn lcd_error_to_io_error(error: LcdError) -> embedded_io::ErrorKind {
     match error {
         LcdError::InvalidArea | LcdError::InvalidColorData => embedded_io::ErrorKind::InvalidInput,
         LcdError::Bus => embedded_io::ErrorKind::Other,
+        LcdError::Unsupported => embedded_io::ErrorKind::Unsupported,
     }
 }
 
 pub trait Lcd {
     fn draw_area(&mut self, area: DrawArea, color: &[u8]) -> Result<(), LcdError>;
+
+    /// Set the display brightness (0 = minimum, 255 = maximum).
+    fn set_brightness(&mut self, _value: u8) -> Result<(), LcdError> {
+        Err(LcdError::Unsupported)
+    }
+
+    /// Return the current display brightness.
+    fn brightness(&self) -> Result<u8, LcdError> {
+        Err(LcdError::Unsupported)
+    }
 }

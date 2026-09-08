@@ -30,6 +30,7 @@ use spin::{Once, RwLock as SpinRwLock};
 #[cfg(any(virtio, enable_block))]
 pub mod block;
 pub mod bus;
+pub(crate) mod backlight;
 pub mod clock;
 pub mod console;
 mod error;
