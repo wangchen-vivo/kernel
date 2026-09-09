@@ -16,3 +16,6 @@
 
 #[cfg(bme280)]
 pub mod bme280;
+
+#[cfg(qmi8658)]
+pub mod qmi8658;

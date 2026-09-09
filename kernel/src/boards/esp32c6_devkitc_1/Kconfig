@@ -60,6 +60,17 @@ config CST9220
       Enable the CST9220 capacitive touch controller on the Waveshare
       ESP32-C6 Touch AMOLED 2.16-inch board.
 
+config QMI8658
+    bool "Enable QMI8658 6-axis IMU"
+    default n
+    select I2C_CORE
+    select USE_EMBEDDED_HAL_V1
+    help
+      Enable the QMI8658 accelerometer/gyroscope/temperature sensor on
+      the Waveshare ESP32-C6 Touch AMOLED 2.16-inch board. The sensor
+      shares the board's I2C0 bus (SDA GPIO8 / SCL GPIO7) at address 0x6B
+      and registers /dev/qmi86580.
+
 config LCD
     bool "Enable LCD device"
     default n

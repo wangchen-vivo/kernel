@@ -848,6 +848,10 @@ crate::define_bus! {
                 rst: get_device!(touch_rst),
             }
         ),
+        #[cfg(qmi8658)]
+        (qmi8658, crate::drivers::sensor::qmi8658::Qmi8658Config,
+            crate::drivers::sensor::qmi8658::Qmi8658Config::new()
+        ),
     ),
 }
 
@@ -1140,7 +1144,7 @@ fn init_i2c0_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<I2c0Bus>>
 }
 
 pub(crate) fn init_i2c_bus() {
-    #[cfg(cst9220)]
+    #[cfg(any(cst9220, qmi8658))]
     {
         use crate::drivers::InitDriver;
 
@@ -1150,6 +1154,7 @@ pub(crate) fn init_i2c_bus() {
                 .expect("failed to register ESP32-C6 I2C0 device");
         }
 
+        #[cfg(cst9220)]
         if let Ok(driver) =
             bus.probe_driver(&crate::drivers::input::cst9220::Cst9220DriverModule::<
                 blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
@@ -1164,6 +1169,21 @@ pub(crate) fn init_i2c_bus() {
         } else {
             kearly_println!("CST9220 device description was not found on I2C0");
             log::warn!("CST9220 device description was not found on I2C0");
+        }
+
+        #[cfg(qmi8658)]
+        if let Ok(driver) =
+            bus.probe_driver(&crate::drivers::sensor::qmi8658::Qmi8658DriverModule)
+        {
+            if let Err(error) = driver.init(bus) {
+                kearly_println!("Failed to initialize QMI8658 driver: {}", error);
+                log::warn!("Failed to initialize QMI8658 driver: {}", error);
+            } else {
+                kearly_println!("QMI8658 IMU device registered as /dev/qmi86580");
+            }
+        } else {
+            kearly_println!("QMI8658 device description was not found on I2C0");
+            log::warn!("QMI8658 device description was not found on I2C0");
         }
     }
 }
