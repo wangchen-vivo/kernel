@@ -503,11 +503,7 @@ pub fn trace_thread_create(thread: ThreadNode) -> Result<(), Error> {
     if !procfs.is_mounted() {
         return Err(code::EINVAL);
     }
-    let root = procfs.root.clone();
-    let pid_dir = root.lookup("0")?;
-    let task_dir = pid_dir.lookup("task")?;
-    let task_dir = task_dir.downcast_ref::<ProcDir>().ok_or(code::EINVAL)?;
-    let thread_dir = task_dir.create_dir(Thread::id(&thread).to_string().as_str(), false)?;
+    let thread_dir = procfs.root.create_dir(Thread::id(&thread).to_string().as_str(), false)?;
     let _ = thread_dir.create_task_file("status", thread.clone())?;
     Ok(())
 }
@@ -517,10 +513,6 @@ pub fn trace_thread_close(thread: ThreadNode) -> Result<(), Error> {
     if !procfs.is_mounted() {
         return Err(code::EINVAL);
     }
-    let root = procfs.root.clone();
-    let pid_dir = root.lookup("0")?;
-    let task_dir = pid_dir.lookup("task")?;
-    let task_dir = task_dir.downcast_ref::<ProcDir>().ok_or(code::EINVAL)?;
-    task_dir.remove(Thread::id(&thread).to_string().as_str());
+    procfs.root.remove(Thread::id(&thread).to_string().as_str());
     Ok(())
 }

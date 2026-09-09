@@ -153,10 +153,9 @@ impl ThreadStats {
         }
     }
 
-    pub fn increment_cycles(&self, cycles: u64) {
-        let cycles = self.get_cycles();
-        self.cycles
-            .set(cycles + cycles.saturating_sub(self.start.get()));
+    pub fn increment_cycles(&self, now: u64) {
+        let delta = now.saturating_sub(self.start.get());
+        self.cycles.set(self.cycles.get().saturating_add(delta));
     }
 
     pub fn set_start_cycles(&self, start: u64) {
