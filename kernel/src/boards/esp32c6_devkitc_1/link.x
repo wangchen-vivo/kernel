@@ -23,8 +23,8 @@ MEMORY
           RTC_IRAM/RTC_DRAM 0x50000000
     */
 
-    /* Unified HP RAM: executable + readable + writable */
-    RAM : ORIGIN = 0x40800000, LENGTH = 0x6E610
+    /* Unified HP RAM: executable + readable + writable. */
+    RAM : ORIGIN = 0x40800000, LENGTH = 0x7E610
 
     /* External flash.
 
@@ -48,7 +48,7 @@ MEMORY
        aliased to both ROTEXT and RODATA. The output sections below make the
        descriptor and read-only data contiguous, then insert the required gap
        before text so the image has exactly two mapped ROM segments. */
-    ROM : ORIGIN = 0x42000000 + 0x20, LENGTH = 0x400000 - 0x20
+    ROM : ORIGIN = 0x42000000 + 0x20, LENGTH = 0x800000 - 0x20
 
     /* RTC fast memory (executable). Persists over deep sleep. */
     RTC_FAST : ORIGIN = 0x50000000, LENGTH = 0x4000
