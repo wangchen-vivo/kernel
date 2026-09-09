@@ -137,13 +137,16 @@ impl ProcFileSystem {
         self.root.create_meminfo_file("meminfo")?;
         self.root.create_stat_file("stat")?;
 
-        // not support process yet, use thread info instead. and put all threads in /proc
+        // BlueOS has no process IDs, so expose every thread's status at /proc/0/task/<tid>/status.
+        let pid_dir = self.root.create_dir("0", false)?;
+        let task_dir = pid_dir.create_dir("task", false)?;
+
         let mut global_queue_visitor = GlobalQueueVisitor::new();
         while let Some(thread) = global_queue_visitor.next() {
             let id = Thread::id(&thread);
             let id_str = id.to_string();
-            log::debug!("create_task_dir: /proc/{}", id_str);
-            let thread_dir = self.root.create_dir(id_str.as_str(), false)?;
+            log::debug!("create_task_dir: /proc/0/task/{}", id_str);
+            let thread_dir = task_dir.create_dir(id_str.as_str(), false)?;
             let _ = thread_dir.create_task_file("status", thread.clone())?;
         }
 
@@ -503,7 +506,11 @@ pub fn trace_thread_create(thread: ThreadNode) -> Result<(), Error> {
     if !procfs.is_mounted() {
         return Err(code::EINVAL);
     }
-    let thread_dir = procfs.root.create_dir(Thread::id(&thread).to_string().as_str(), false)?;
+    let root = procfs.root.clone();
+    let pid_dir = root.lookup("0")?;
+    let task_dir = pid_dir.lookup("task")?;
+    let task_dir = task_dir.downcast_ref::<ProcDir>().ok_or(code::EINVAL)?;
+    let thread_dir = task_dir.create_dir(Thread::id(&thread).to_string().as_str(), false)?;
     let _ = thread_dir.create_task_file("status", thread.clone())?;
     Ok(())
 }
@@ -513,6 +520,10 @@ pub fn trace_thread_close(thread: ThreadNode) -> Result<(), Error> {
     if !procfs.is_mounted() {
         return Err(code::EINVAL);
     }
-    procfs.root.remove(Thread::id(&thread).to_string().as_str());
+    let root = procfs.root.clone();
+    let pid_dir = root.lookup("0")?;
+    let task_dir = pid_dir.lookup("task")?;
+    let task_dir = task_dir.downcast_ref::<ProcDir>().ok_or(code::EINVAL)?;
+    task_dir.remove(Thread::id(&thread).to_string().as_str());
     Ok(())
 }

@@ -202,6 +202,7 @@ fn init_apps() {
                 thread::Stack::from_size(blueos_kconfig::CONFIG_MAIN_THREAD_STACK_SIZE as usize)
                     .expect("Invalid main thread stack size");
             thread::Builder::new(thread::Entry::C(*app))
+                .set_name(b"app-main")
                 .set_stack(stack)
                 .start();
             app = app.offset(1);

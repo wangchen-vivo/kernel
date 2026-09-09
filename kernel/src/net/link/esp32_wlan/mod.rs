@@ -322,6 +322,7 @@ impl Esp32WlanLink {
             Entry::C(wifi_inner_init),
             ThreadKind::Normal,
         );
+        wifi_init.lock().set_name(b"wifi-init");
         let ok = scheduler::queue_ready_thread(thread::IDLE, wifi_init);
         debug_assert_eq!(ok, Ok(()));
         Self {

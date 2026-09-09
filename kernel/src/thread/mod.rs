@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern crate alloc;
 #[cfg(event_flags)]
 use crate::sync::event_flags::EventFlagsMode;
 use crate::{
@@ -45,6 +44,7 @@ mod builder;
 pub use builder::*;
 
 pub type ThreadNode = Arc<Thread>;
+pub const THREAD_NAME_LEN: usize = 16;
 
 pub enum Entry {
     C(extern "C" fn()),
@@ -239,6 +239,10 @@ pub struct Thread {
     signal_context: Option<Box<SignalContext>>,
     #[cfg(round_robin)]
     rr: RoundRobin,
+    /// Thread name (15 bytes plus a trailing NUL, matching Linux TASK_COMM_LEN).
+    /// An empty name falls back to [`Thread::kind_to_str`]. Like the other
+    /// non-atomic fields, it is protected by `lock` once the thread is published.
+    name: [u8; THREAD_NAME_LEN],
 }
 
 #[cfg(round_robin)]
@@ -355,6 +359,29 @@ impl Thread {
         }
     }
 
+    /// Set a human-readable name. Callers of a published thread must hold its
+    /// write lock.
+    ///
+    /// Names are byte strings limited to 15 bytes plus a trailing NUL.
+    pub(crate) fn set_name(&mut self, name: &[u8]) {
+        let len = name.len().min(THREAD_NAME_LEN - 1);
+        self.name.fill(0);
+        self.name[..len].copy_from_slice(&name[..len]);
+    }
+
+    /// Get the thread name. If no custom name was set, falls back to kind_to_str().
+    pub fn name(&self) -> &str {
+        if self.name[0] == 0 {
+            return self.kind_to_str();
+        }
+        let len = self
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.name.len());
+        core::str::from_utf8(&self.name[..len]).unwrap_or(self.kind_to_str())
+    }
+
     #[inline]
     pub fn transfer_state(&self, from: Uint, to: Uint) -> Result<(), Uint> {
         self.state
@@ -454,6 +481,7 @@ impl Thread {
             signal_context: None,
             #[cfg(round_robin)]
             rr: RoundRobin::new(),
+            name: [0u8; THREAD_NAME_LEN],
         }
     }
 

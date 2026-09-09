@@ -89,6 +89,7 @@ impl SchedulerImplementation for BkScheduler {
             blueos_prio = blueos_prio.min(1);
         }
         let thread = blueos::thread::Builder::new(entry)
+            .set_name(_name.as_bytes())
             .set_stack(stack)
             .set_priority(blueos_prio as ThreadPriority)
             .start();

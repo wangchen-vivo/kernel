@@ -229,6 +229,7 @@ pub(crate) fn init() {
         panic!("Invalid stack");
     };
     let t = ThreadBuilder::new(Entry::C(net_stack_main_loop))
+        .set_name(b"net-stack")
         .set_stack(stack)
         .start();
 }

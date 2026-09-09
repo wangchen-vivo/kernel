@@ -30,7 +30,7 @@ use config::{DEFAULT_STACK_SIZE, SYSTEM_THREAD_STACK_SIZE};
 use core::{alloc::Layout, mem::MaybeUninit};
 use thread::{
     Entry, GlobalQueueListHead, OffsetOfGlobal, Stack, Thread, ThreadKind, ThreadNode,
-    ThreadPriority,
+    ThreadPriority, THREAD_NAME_LEN,
 };
 
 type Head = ListHead<Thread, OffsetOfGlobal>;
@@ -105,6 +105,7 @@ pub struct Builder {
     stack: Option<Stack>,
     entry: Entry,
     priority: ThreadPriority,
+    name: [u8; THREAD_NAME_LEN],
 }
 
 impl Builder {
@@ -113,7 +114,16 @@ impl Builder {
             stack: None,
             entry,
             priority: config::MAX_THREAD_PRIORITY / 2,
+            name: [0u8; THREAD_NAME_LEN],
         }
+    }
+
+    #[inline]
+    pub fn set_name(mut self, name: &[u8]) -> Self {
+        let len = name.len().min(THREAD_NAME_LEN - 1);
+        self.name[..len].copy_from_slice(&name[..len]);
+        self.name[len] = 0;
+        self
     }
 
     #[inline]
@@ -131,6 +141,7 @@ impl Builder {
     pub fn build(mut self) -> ThreadNode {
         let thread = ThreadNode::new(Thread::new(ThreadKind::Normal));
         let mut w = thread.lock();
+        w.set_name(&self.name);
         let stack = self
             .stack
             .take()
@@ -218,6 +229,10 @@ pub(crate) fn build_static_thread(
     drop(w);
     t.write(arc.clone());
     GlobalQueueVisitor::add(arc.clone());
+    #[cfg(procfs)]
+    {
+        let _ = crate::vfs::trace_thread_create(arc.clone());
+    }
     arc
 }
 
@@ -227,6 +242,21 @@ mod tests {
     use crate::sync::ConstBarrier;
     use blueos_test_macro::test;
     use core::alloc::Layout;
+
+    #[test]
+    fn thread_name_is_bounded_and_falls_back_to_kind() {
+        let mut thread = Thread::new(ThreadKind::Normal);
+        assert_eq!(thread.name(), "normal");
+
+        thread.set_name(b"wifi-scan");
+        assert_eq!(thread.name(), "wifi-scan");
+
+        thread.set_name(b"1234567890abcdef");
+        assert_eq!(thread.name(), "1234567890abcde");
+
+        thread.set_name(b"");
+        assert_eq!(thread.name(), "normal");
+    }
 
     #[test]
     fn test_use_alloc_stack() {

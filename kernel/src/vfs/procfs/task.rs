@@ -33,10 +33,11 @@ impl ProcTaskFile {
 impl ProcFileOps for ProcTaskFile {
     fn get_content(&self) -> Result<Vec<u8>, Error> {
         let mut result = String::with_capacity(64);
-        writeln!(result, "{:<9} {}", "Name:", self.thread.kind_to_str()).unwrap();
-        writeln!(result, "{:<9} {}", "State:", self.thread.state_to_str()).unwrap();
+        let thread = self.thread.lock_for_read();
+        writeln!(result, "{:<9} {}", "Name:", thread.name()).unwrap();
+        writeln!(result, "{:<9} {}", "State:", thread.state_to_str()).unwrap();
         writeln!(result, "{:<9} {}", "Tid:", Thread::id(&self.thread)).unwrap();
-        writeln!(result, "{:<9} {}", "Priority:", self.thread.priority()).unwrap();
+        writeln!(result, "{:<9} {}", "Priority:", thread.priority()).unwrap();
         Ok(result.as_bytes().to_vec())
     }
 
