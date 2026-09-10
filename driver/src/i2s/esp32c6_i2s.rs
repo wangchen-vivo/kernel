@@ -249,7 +249,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         }
 
         // half_sample_bits = total_slot * slot_width / 2.
-        // ESP-IDF TDM Philips mode uses total_slot (4), not active channels (2).
+        // ESP-IDF TDM mode uses total_slot (4) instead of active channels (2).
         // For 4 slots × 32-bit = 128, half = 64.
         let total_slot = 4u32;
         let half_sample_bits = total_slot * slot_width as u32 / 2;
@@ -283,8 +283,8 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         // Configure the fractional clock divider (PCR.I2S_TX/RX_CLKM_DIV_CONF).
         //
         // The integer divider (I2S_CLKM_DIV_NUM) alone can only produce
-        // f_xtal / N. For 16 kHz × 256 = 4.096 MHz with a 40 MHz XTAL the
-        // ratio is 625/64 = 9.765625, which is not an integer. The PCR
+        // f_xtal / N.  For 16 kHz × 256 = 4.096 MHz with a 40 MHz XTAL the
+        // ratio is 625/64 = 9.765625, which is not an integer.  The PCR
         // fractional divider fills in the sub-integer part so the ES8311
         // receives an exact MCLK that matches a coeff_div[] table entry.
         //
@@ -318,8 +318,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
             }
         };
         log::info!(
-            "[I2S] MCLK source={}Hz sel=0 div: integer={}, fractional=0x{:08x} (target {} Hz)",
-            XTAL_HZ,
+            "[I2S] MCLK div: integer={}, fractional=0x{:08x} (target {} Hz)",
             mclk_div,
             div_conf,
             mclk
@@ -328,8 +327,11 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         self.pcr.i2s_rx_clkm_div_conf.set(div_conf);
 
         // Program BCK divider and bit width in CONF1.
-        // Match ESP-IDF TDM Philips: 4 slots × 32-bit, data_bit_width = slot_width.
-        // bits_mod = slot_width - 1; half_sample_bits = total_slot * slot_width / 2.
+        // Match ESP-IDF TDM Philips: 4 slots × 32-bit, data_bit_width=32.
+        // bits_mod = data_bit_width - 1 = 31
+        // half_sample_bits = total_slot * slot_width / 2 = 4 * 32 / 2 = 64 → 63
+        // tdm_ws_width = half_sample_bits - 1 = 63 (AUTO = total_slot*slot_bits/2)
+        // tdm_chan_bits = slot_width - 1 = 31
         let bits_field = (slot_width as u32 - 1) & 0x1f;
         let total_slot = 4u32;
         let half_sample_bits = total_slot * slot_width as u32 / 2;
@@ -337,7 +339,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         let tdm_ws_width = (half_sample_bits - 1) & 0x7f;
         let tdm_chan_bits = (slot_width as u32 - 1) & 0x1f;
 
-        // TX_CONF1: BCK_DIV_NUM | BITS_MOD | HALF_SAMPLE_BITS | MSB_SHIFT (Philips).
+        // TX_CONF1: BCK_DIV_NUM | BITS_MOD | HALF_SAMPLE_BITS | MSB_SHIFT | BCK_NO_DLY.
         self.registers.tx_conf1.write(
             Conf1::TDM_WS_WIDTH.val(tdm_ws_width)
                 + Conf1::BCK_DIV_NUM.val(bck_div_field)
@@ -368,11 +370,8 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
     /// The actual TX/RX unit and FIFO reset happens in `configure()` after
     /// `tx_update()`, not here.
     fn configure_tx(&self, cfg: &I2sConfig) {
-        // Build TX_CONF value — matches the reference ESP-IDF I2S std mode.
-        // TX_TDM_EN: TDM mode (TRM: TDM_EN and PDM_EN cannot be both 0 or both 1).
-        // TX_MONO_FST_VLD: first channel data is valid in mono mode.
-        // TX_CHAN_MOD=0: two channels, both left and right active (stereo).
-        // Use standard I2S mode (BCK/WS output to GPIO, no internal loopback).
+        // TDM mode: TX_TDM_EN=1, TX_PDM_EN=0 (i2s_ll_tx_enable_tdm).
+        // TX_PCM_BYPASS=1, TX_MONO_FST_VLD=1, TX_CHAN_MOD=0 (stereo).
         let mut conf = TxConf::TX_PCM_BYPASS::SET
             + TxConf::TX_TDM_EN::SET
             + TxConf::TX_MONO_FST_VLD::SET
@@ -382,7 +381,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         }
         self.registers.tx_conf.write(conf);
 
-        // TDM_CTRL: 4 slots total, slot mask 0xF (SLOT0-3) for stereo.
+        // TDM_CTRL: 4 slots total, slot mask 0xF (SLOT0-3).
         let (chan_en, tot_chan) = match cfg.channel_mode {
             I2sChannelMode::Stereo => (0xF, 4 - 1),
             I2sChannelMode::Mono => (0x1, 4 - 1),
@@ -398,12 +397,8 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
     /// The actual TX/RX unit and FIFO reset happens in `configure()` after
     /// `rx_update()`, not here.
     fn configure_rx(&self, cfg: &I2sConfig) {
-        // RX_TDM_EN: TDM mode (TRM: TDM_EN and PDM_EN cannot be both 0 or both 1).
-        // RX_MONO_FST_VLD: first channel data is valid in mono mode.
-        // RX_STOP_MODE=2: stop when RX_START=0 or RX FIFO is full.
-        // RX_SLAVE_MOD is NOT set — it was only needed for SIG_LOOPBACK mode
-        // where RX shared TX's clocks internally. In standard I2S mode RX
-        // generates its own BCK/WS (or follows the master externally).
+        // TDM mode: RX_TDM_EN=1, RX_PDM_EN=0 (i2s_ll_rx_enable_tdm).
+        // RX_PCM_BYPASS=1, RX_MONO_FST_VLD=1, RX_STOP_MODE=2.
         let mut conf = RxConf::RX_PCM_BYPASS::SET
             + RxConf::RX_TDM_EN::SET
             + RxConf::RX_MONO_FST_VLD::SET
@@ -416,7 +411,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         // RXEOF_NUM: number of RX data words before in_suc_eof fires.
         self.registers.rxeof_num.set(0x40);
 
-        // TDM_CTRL: 4 slots total, slot mask 0xF (SLOT0-3), same as TX.
+        // TDM_CTRL: 4 slots total, slot mask 0xF (SLOT0-3).
         let (chan_en, tot_chan) = match cfg.channel_mode {
             I2sChannelMode::Stereo => (0xF, 4 - 1),
             I2sChannelMode::Mono => (0x1, 4 - 1),
