@@ -501,7 +501,8 @@ impl SmoltcpDevice for Esp32WlanLink {
             let octets: Result<Vec<u8>, _> = parts.map(|s| s.parse::<u8>()).collect();
             match octets {
                 Ok(octets) if octets.len() == 4 => {
-                    Some(Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]))
+                    let address = Ipv4Address::new(octets[0], octets[1], octets[2], octets[3]);
+                    IpAddress::Ipv4(address).is_unicast().then_some(address)
                 }
                 _ => None,
             }
@@ -516,10 +517,15 @@ impl SmoltcpDevice for Esp32WlanLink {
         );
         let router_ip =
             ip_parser(core::str::from_utf8(blueos_kconfig::CONFIG_NET_ROUTER_IP).unwrap_or(""))
-                .unwrap_or(Ipv4Address::new(0, 0, 0, 0));
+                .unwrap_or(Ipv4Address::new(10, 171, 198, 28));
         let static_ip =
             ip_parser(core::str::from_utf8(blueos_kconfig::CONFIG_NET_STATIC_IP).unwrap_or(""))
-                .unwrap_or(Ipv4Address::new(0, 0, 0, 0));
+                .unwrap_or(Ipv4Address::new(10, 171, 198, 11));
+        log::info!(
+            "WiFi IPv4 configuration: address={}/24 gateway={}",
+            static_ip,
+            router_ip
+        );
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(static_ip), 24));
         });
