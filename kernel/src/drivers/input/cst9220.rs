@@ -229,6 +229,13 @@ where
             crate::error::code::EIO
         })?;
 
+        // Switch to normal scan mode so the chip runs at its maximum touch
+        // sampling rate (100 Hz) instead of a lower low-power rate.
+        touch.set_mode(cst92xx::mode::RunMode::Normal).map_err(|error| {
+            log::warn!("Failed to set CST9220 to normal mode: {:?}", error);
+            crate::error::code::EIO
+        })?;
+
         let info = touch.chip_info();
         if info.chip_type != cst92xx::registers::CST9220_CHIP_ID
             && info.chip_type != cst92xx::registers::CST9217_CHIP_ID
