@@ -48,7 +48,11 @@ MEMORY
        aliased to both ROTEXT and RODATA. The output sections below make the
        descriptor and read-only data contiguous, then insert the required gap
        before text so the image has exactly two mapped ROM segments. */
-    ROM : ORIGIN = 0x42000000 + 0x20, LENGTH = 0x800000 - 0x20
+    /* Keep all packaged application segments below physical Flash offset
+       0x800000. The remaining space in the first half covers the application
+       offset, RAM load segments, image headers, and alignment padding.
+       The upper 8 MiB is reserved for the raw Flash device region. */
+    ROM : ORIGIN = 0x42000000 + 0x20, LENGTH = 0x700000 - 0x20
 
     /* RTC fast memory (executable). Persists over deep sleep. */
     RTC_FAST : ORIGIN = 0x50000000, LENGTH = 0x4000

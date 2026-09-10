@@ -1189,6 +1189,21 @@ pub(crate) fn init_i2c_bus() {
 }
 pub(crate) fn init_gpio() {}
 
+#[cfg(esp32_internal_flash)]
+pub(crate) fn init_internal_flash() {
+    if let Err(error) = crate::drivers::flash::init_internal_flash() {
+        kearly_println!("Failed to initialize ESP32-C6 internal Flash: {:?}", error);
+        log::error!("Failed to initialize ESP32-C6 internal Flash: {:?}", error);
+        return;
+    }
+    if let Err(error) = crate::drivers::flash::init_esp32_flash_device() {
+        kearly_println!("Failed to register /dev/esp32-flash0: {:?}", error);
+        log::error!("Failed to register /dev/esp32-flash0: {:?}", error);
+    } else {
+        kearly_println!("ESP32-C6 internal Flash registered as /dev/esp32-flash0");
+    }
+}
+
 #[inline(always)]
 pub(crate) fn send_ipi(_hart: usize) {}
 

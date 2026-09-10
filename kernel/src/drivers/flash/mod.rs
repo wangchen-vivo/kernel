@@ -18,3 +18,15 @@
 pub mod spi_flash;
 #[cfg(enable_block)]
 pub mod spi_flash_cmd;
+
+#[cfg(esp32_internal_flash)]
+mod esp32_flash;
+#[cfg(esp32_internal_flash)]
+mod esp32_rom;
+#[cfg(esp32_internal_flash)]
+mod internal_flash;
+
+#[cfg(esp32_internal_flash)]
+pub use esp32_flash::{init_esp32_flash_device, ESP32_FLASH_DEVICE_NAME};
+#[cfg(esp32_internal_flash)]
+pub use internal_flash::init_internal_flash;

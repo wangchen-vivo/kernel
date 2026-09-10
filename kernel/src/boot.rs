@@ -121,6 +121,8 @@ extern "C" fn init() {
     crate::boards::init_i2c_bus();
     #[cfg(gpio)]
     crate::boards::init_gpio();
+    #[cfg(esp32_internal_flash)]
+    crate::boards::init_internal_flash();
     #[cfg(enable_vfs)]
     init_vfs();
 

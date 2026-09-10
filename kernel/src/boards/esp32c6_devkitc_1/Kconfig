@@ -25,6 +25,26 @@ config SOC_ESP32C6
     select HAS_MIE
     select I2C_CORE
 
+config ESP32_INTERNAL_FLASH
+    bool "Expose a reserved internal Flash region as a raw device"
+    default n
+    help
+      Register /dev/esp32-flash0 for raw read, program, and sector erase.
+
+config ESP32_FLASH_IO_REGION_BASE
+    hex "Raw Flash device region base"
+    default 0x00800000
+    depends on ESP32_INTERNAL_FLASH
+    help
+      Physical offset of the reserved raw Flash region.
+
+config ESP32_FLASH_IO_REGION_SIZE
+    hex "Raw Flash device region size"
+    default 0x00800000
+    depends on ESP32_INTERNAL_FLASH
+    help
+      Size of the reserved raw Flash region. It must be sector-aligned.
+
 config SD_CARD
     bool "Enable SD card over SPI"
     default n
