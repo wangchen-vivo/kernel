@@ -27,7 +27,7 @@ use blueos_hal::{Configuration, PlatPeri};
 use core::cell::UnsafeCell;
 
 use crate::dma::esp32c6_gdma::{
-    capture_gdma_status, tx_peripheral, DmaDescriptor, Esp32c6GdmaChannel, PERI_I2S0,
+    capture_gdma_status, DmaDescriptor, Esp32c6GdmaChannel, PERI_I2S0,
 };
 use crate::static_ref::StaticRef;
 use tock_registers::{
@@ -35,8 +35,6 @@ use tock_registers::{
     register_bitfields, register_structs,
     registers::{ReadOnly, ReadWrite, WriteOnly},
 };
-
-static TX_ATTEMPTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// I2S0 peripheral base address on ESP32-C6.
 const I2S0_BASE: usize = 0x6000_C000;
@@ -627,61 +625,13 @@ impl<const TX_CH: usize, const RX_CH: usize> I2s<I2sConfig, ()>
         let desc = unsafe { &mut *self.tx_desc.get() };
         *desc = DmaDescriptor::for_tx(buf.as_ptr() as *mut u8, buf.len(), true);
 
-        let attempt = TX_ATTEMPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if attempt < 3 || attempt % 32 == 0 {
-            log::warn!(
-                "[GDMA-ARB] I2S_PERI_BEFORE=0x{:02x}",
-                tx_peripheral::<TX_CH>()
-            );
-            log::info!(
-                "[I2S] TX begin attempt={} len={} buf={:p} desc=0x{:08x} dw0=0x{:08x} tx_conf=0x{:08x} tx_conf1=0x{:08x} tx_tdm=0x{:08x} state=0x{:08x} pcr_tx=0x{:08x} pcr_rx=0x{:08x}",
-                attempt,
-                buf.len(),
-                buf.as_ptr(),
-                core::ptr::addr_of!(*desc) as usize as u32,
-                desc.dw0,
-                self.registers.tx_conf.get(),
-                self.registers.tx_conf1.get(),
-                self.registers.tx_tdm_ctrl.get(),
-                self.registers.state.get(),
-                self.pcr.i2s_tx_clkm_conf.get(),
-                self.pcr.i2s_rx_clkm_conf.get(),
-            );
-            log::info!(
-                "[GDMA-ARB] I2S TX channel={} peri_before={} (expected {})",
-                TX_CH,
-                tx_peripheral::<TX_CH>(),
-                PERI_I2S0
-            );
-        }
-
         // Start DMA and I2S TX.
         Esp32c6GdmaChannel::<TX_CH>::start_tx(desc);
 
         // The LCD also uses GDMA channel 0. Re-assert the I2S route after the
         // channel reset, immediately before enabling the I2S TX request.
         Esp32c6GdmaChannel::<TX_CH>::set_tx_peri(PERI_I2S0);
-        if attempt < 3 || attempt % 32 == 0 {
-            log::info!(
-                "[GDMA-ARB] I2S TX channel={} peri_after_rebind={} (expected {})",
-                TX_CH,
-                tx_peripheral::<TX_CH>(),
-                PERI_I2S0
-            );
-        }
         self.registers.tx_conf.modify(TxConf::TX_START::SET);
-
-        if attempt < 3 || attempt % 32 == 0 {
-            let status = capture_gdma_status();
-            log::info!(
-                "[I2S] TX started attempt={} i2s_int=0x{:08x} tx_conf=0x{:08x} state=0x{:08x} | {}",
-                attempt,
-                self.registers.int_raw.get(),
-                self.registers.tx_conf.get(),
-                self.registers.state.get(),
-                status
-            );
-        }
 
         // Wait for the DMA to finish.
         let result = Esp32c6GdmaChannel::<TX_CH>::wait_tx_done();
@@ -689,8 +639,7 @@ impl<const TX_CH: usize, const RX_CH: usize> I2s<I2sConfig, ()>
         if let Err(error) = result {
             let status = capture_gdma_status();
             log::error!(
-                "[I2S] TX failed attempt={} len={} error={:?} i2s_int=0x{:08x} tx_conf=0x{:08x} tx_conf1=0x{:08x} state=0x{:08x} | {}",
-                attempt,
+                "[I2S] TX failed len={} error={:?} i2s_int=0x{:08x} tx_conf=0x{:08x} tx_conf1=0x{:08x} state=0x{:08x} | {}",
                 buf.len(),
                 error,
                 self.registers.int_raw.get(),
