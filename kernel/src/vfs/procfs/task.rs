@@ -35,6 +35,7 @@ impl ProcFileOps for ProcTaskFile {
         let mut result = String::with_capacity(64);
         let thread = self.thread.lock_for_read();
         writeln!(result, "{:<9} {}", "Name:", thread.name()).unwrap();
+        writeln!(result, "{:<9} {}", "Kind:", thread.kind_to_str()).unwrap();
         writeln!(result, "{:<9} {}", "State:", thread.state_to_str()).unwrap();
         writeln!(result, "{:<9} {}", "Tid:", Thread::id(&self.thread)).unwrap();
         writeln!(result, "{:<9} {}", "Priority:", thread.priority()).unwrap();

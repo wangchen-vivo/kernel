@@ -517,10 +517,10 @@ impl SmoltcpDevice for Esp32WlanLink {
         );
         let router_ip =
             ip_parser(core::str::from_utf8(blueos_kconfig::CONFIG_NET_ROUTER_IP).unwrap_or(""))
-                .unwrap_or(Ipv4Address::new(10, 171, 198, 28));
+                .unwrap_or(Ipv4Address::new(0, 0, 0, 0));
         let static_ip =
             ip_parser(core::str::from_utf8(blueos_kconfig::CONFIG_NET_STATIC_IP).unwrap_or(""))
-                .unwrap_or(Ipv4Address::new(10, 171, 198, 11));
+                .unwrap_or(Ipv4Address::new(0, 0, 0, 0));
         log::info!(
             "WiFi IPv4 configuration: address={}/24 gateway={}",
             static_ip,

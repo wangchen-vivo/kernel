@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+mod cpuinfo;
 mod memory_info;
 mod stat;
 mod task;
 
+#[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+use cpuinfo::CpuInfo;
 use memory_info::MemoryInfo;
 use stat::SystemStat;
 use task::ProcTaskFile;
@@ -136,6 +140,8 @@ impl ProcFileSystem {
 
         self.root.create_meminfo_file("meminfo")?;
         self.root.create_stat_file("stat")?;
+        #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+        self.root.create_cpuinfo_file("cpuinfo")?;
 
         // BlueOS has no process IDs, so expose every thread's status at /proc/0/task/<tid>/status.
         let pid_dir = self.root.create_dir("0", false)?;
@@ -273,6 +279,18 @@ impl ProcDir {
         let ino = self.base.fs.upgrade().unwrap().alloc_inode_no();
         let inode =
             ProcFile::new(SystemStat {}, ino, self.base.fs.clone(), true) as Arc<dyn InodeOps>;
+        self.insert(name, inode.clone());
+        Ok(inode)
+    }
+
+    #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+    pub fn create_cpuinfo_file(&self, name: &str) -> Result<Arc<dyn InodeOps>, Error> {
+        if name.len() > NAME_MAX {
+            return Err(code::ENAMETOOLONG);
+        }
+        let ino = self.base.fs.upgrade().unwrap().alloc_inode_no();
+        let inode =
+            ProcFile::new(CpuInfo {}, ino, self.base.fs.clone(), true) as Arc<dyn InodeOps>;
         self.insert(name, inode.clone());
         Ok(inode)
     }
