@@ -14,10 +14,12 @@
 
 use core::sync::atomic::AtomicUsize;
 
-use crate::devices::backlight::{BacklightDevice, BacklightOps};
-use crate::devices::framebuffer::{
-    FramebufferBitfield, FramebufferDevice, FramebufferFixedInfo, FramebufferOps,
-    FramebufferVariableInfo,
+use crate::devices::{
+    backlight::{BacklightDevice, BacklightOps},
+    framebuffer::{
+        FramebufferBitfield, FramebufferDevice, FramebufferDrawArea, FramebufferFixedInfo,
+        FramebufferOps, FramebufferVariableInfo,
+    },
 };
 use alloc::sync::Arc;
 use blueos_infra::tinyrwlock::RwLock;
@@ -71,7 +73,10 @@ impl<T: Lcd + 'static> LcdFramebuffer<T> {
             height,
             display: lcd,
         }));
-        FramebufferDevice::register(INDEX.load(core::sync::atomic::Ordering::Relaxed), fb.clone())?;
+        FramebufferDevice::register(
+            INDEX.load(core::sync::atomic::Ordering::Relaxed),
+            fb.clone(),
+        )?;
         INDEX.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
 
         // Register the backlight device sharing the same LcdFramebuffer.
@@ -198,6 +203,83 @@ impl<T: Lcd> FramebufferOps for LcdFramebuffer<T> {
         }
 
         Ok(written)
+    }
+
+    fn draw_area(
+        &mut self,
+        area: FramebufferDrawArea,
+        pixels: &[u8],
+    ) -> Result<(), embedded_io::ErrorKind> {
+        if area.width == 0 || area.height == 0 {
+            return Err(embedded_io::ErrorKind::InvalidInput);
+        }
+
+        let end_x = area
+            .x
+            .checked_add(area.width)
+            .ok_or(embedded_io::ErrorKind::InvalidInput)?;
+        let end_y = area
+            .y
+            .checked_add(area.height)
+            .ok_or(embedded_io::ErrorKind::InvalidInput)?;
+        if end_x > self.width || end_y > self.height {
+            return Err(embedded_io::ErrorKind::InvalidInput);
+        }
+
+        let row_bytes = usize::try_from(area.width)
+            .ok()
+            .and_then(|width| width.checked_mul(LCD_BYTES_PER_PIXEL as usize))
+            .ok_or(embedded_io::ErrorKind::InvalidInput)?;
+        let stride =
+            usize::try_from(area.stride).map_err(|_| embedded_io::ErrorKind::InvalidInput)?;
+        let height =
+            usize::try_from(area.height).map_err(|_| embedded_io::ErrorKind::InvalidInput)?;
+        if stride < row_bytes {
+            return Err(embedded_io::ErrorKind::InvalidInput);
+        }
+        let source_len = (height - 1)
+            .checked_mul(stride)
+            .and_then(|prefix| prefix.checked_add(row_bytes))
+            .ok_or(embedded_io::ErrorKind::InvalidInput)?;
+        if pixels.len() < source_len {
+            return Err(embedded_io::ErrorKind::InvalidInput);
+        }
+
+        if stride == row_bytes {
+            let byte_count = row_bytes
+                .checked_mul(height)
+                .ok_or(embedded_io::ErrorKind::InvalidInput)?;
+            return self
+                .display
+                .draw_area(
+                    DrawArea {
+                        row_start: area.y,
+                        row_end: end_y - 1,
+                        col_start: area.x,
+                        col_end: end_x - 1,
+                    },
+                    &pixels[..byte_count],
+                )
+                .map_err(lcd_error_to_io_error);
+        }
+
+        for row in 0..height {
+            let offset = row
+                .checked_mul(stride)
+                .ok_or(embedded_io::ErrorKind::InvalidInput)?;
+            self.display
+                .draw_area(
+                    DrawArea {
+                        row_start: area.y + row as u32,
+                        row_end: area.y + row as u32,
+                        col_start: area.x,
+                        col_end: end_x - 1,
+                    },
+                    &pixels[offset..offset + row_bytes],
+                )
+                .map_err(lcd_error_to_io_error)?;
+        }
+        Ok(())
     }
 
     fn byte_len(&self) -> Result<u64, embedded_io::ErrorKind> {

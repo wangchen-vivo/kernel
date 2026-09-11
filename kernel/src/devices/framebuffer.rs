@@ -16,7 +16,7 @@ use crate::devices::{Device, DeviceClass, DeviceId, DeviceManager};
 use alloc::{format, string::String, sync::Arc, vec, vec::Vec};
 use blueos_infra::tinyrwlock::RwLock;
 use embedded_io::ErrorKind;
-use libc::{FBIOGET_FSCREENINFO, FBIOGET_VSCREENINFO, FBIOPUT_VSCREENINFO};
+use libc::{FBIOGET_FSCREENINFO, FBIOGET_VSCREENINFO, FBIOPUT_VSCREENINFO, FBIO_DRAW_AREA};
 
 /// Linux framebuffer character-device major number.
 pub const FRAMEBUFFER_MAJOR: usize = 29;
@@ -139,6 +139,17 @@ const _: [(); 12] = [(); core::mem::size_of::<FramebufferBitfield>()];
 const _: [(); 80] = [(); core::mem::size_of::<FramebufferFixedInfo>()];
 const _: [(); 160] = [(); core::mem::size_of::<FramebufferVariableInfo>()];
 
+/// Geometry and source layout for a two-dimensional framebuffer update.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FramebufferDrawArea {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Source bytes between the start of two consecutive rows.
+    pub stride: u32,
+}
+
 unsafe fn load_user_variable_info(
     ptr: *const FramebufferVariableInfo,
 ) -> Result<FramebufferVariableInfo, ErrorKind> {
@@ -146,6 +157,15 @@ unsafe fn load_user_variable_info(
         return Err(ErrorKind::InvalidInput);
     }
     Ok(*ptr)
+}
+
+unsafe fn load_user_draw_area(
+    ptr: *const libc::fb_draw_area,
+) -> Result<libc::fb_draw_area, ErrorKind> {
+    if ptr.is_null() {
+        return Err(ErrorKind::InvalidInput);
+    }
+    Ok(core::ptr::read(ptr))
 }
 
 unsafe fn store_user_fixed_info(
@@ -189,6 +209,9 @@ pub trait FramebufferOps {
 
     /// Write framebuffer bytes starting at `offset`.
     fn write_bytes(&mut self, offset: u64, buf: &[u8]) -> Result<usize, ErrorKind>;
+
+    /// Draw a two-dimensional pixel area from a source buffer.
+    fn draw_area(&mut self, area: FramebufferDrawArea, pixels: &[u8]) -> Result<(), ErrorKind>;
 
     /// Return the framebuffer byte length.
     fn byte_len(&self) -> Result<u64, ErrorKind>;
@@ -262,6 +285,59 @@ impl<T: FramebufferOps + 'static> FramebufferDevice<T> {
     ) -> Result<FramebufferVariableInfo, ErrorKind> {
         self.ops.write().set_variable_info(variable_info)
     }
+
+    fn draw_area(&self, request: &libc::fb_draw_area) -> Result<(), ErrorKind> {
+        if request.pixels.is_null() || request.width == 0 || request.height == 0 {
+            return Err(ErrorKind::InvalidInput);
+        }
+
+        let mut ops = self.ops.write();
+        let info = ops.variable_info()?;
+        if info.bits_per_pixel == 0 || info.bits_per_pixel % 8 != 0 {
+            return Err(ErrorKind::Unsupported);
+        }
+
+        let bytes_per_pixel = info.bits_per_pixel / 8;
+        let end_x = request
+            .x
+            .checked_add(request.width)
+            .ok_or(ErrorKind::InvalidInput)?;
+        let end_y = request
+            .y
+            .checked_add(request.height)
+            .ok_or(ErrorKind::InvalidInput)?;
+        if end_x > info.xres || end_y > info.yres {
+            return Err(ErrorKind::InvalidInput);
+        }
+
+        let row_bytes = request
+            .width
+            .checked_mul(bytes_per_pixel)
+            .ok_or(ErrorKind::InvalidInput)?;
+        if request.stride < row_bytes || request.stride % bytes_per_pixel != 0 {
+            return Err(ErrorKind::InvalidInput);
+        }
+        let source_len = request
+            .height
+            .checked_sub(1)
+            .and_then(|rows| rows.checked_mul(request.stride))
+            .and_then(|prefix| prefix.checked_add(row_bytes))
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or(ErrorKind::InvalidInput)?;
+        let pixels =
+            unsafe { core::slice::from_raw_parts(request.pixels.cast::<u8>(), source_len) };
+
+        ops.draw_area(
+            FramebufferDrawArea {
+                x: request.x,
+                y: request.y,
+                width: request.width,
+                height: request.height,
+                stride: request.stride,
+            },
+            pixels,
+        )
+    }
 }
 
 impl<T: FramebufferOps + 'static> Device for FramebufferDevice<T> {
@@ -329,7 +405,11 @@ impl<T: FramebufferOps + 'static> Device for FramebufferDevice<T> {
                     store_user_variable_info(arg as *mut FramebufferVariableInfo, &effective_info)
                 }
             }
-            _ => Err(ErrorKind::InvalidData),
+            req if req == FBIO_DRAW_AREA => {
+                let request = unsafe { load_user_draw_area(arg as *const libc::fb_draw_area)? };
+                self.draw_area(&request)
+            }
+            _ => Err(ErrorKind::Unsupported),
         }
     }
 

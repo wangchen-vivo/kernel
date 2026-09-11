@@ -622,6 +622,15 @@ impl WifiOps for Esp32WlanLink {
         } else {
             wifi_scan_type_t_WIFI_SCAN_TYPE_PASSIVE
         };
+        cfg.channel = config.channel.try_into().unwrap_or(0);
+        if cfg.scan_type == wifi_scan_type_t_WIFI_SCAN_TYPE_ACTIVE {
+            // The driver default allows 120 ms on every channel. A shorter
+            // dwell keeps the single CPU responsive while still leaving enough
+            // time for nearby access points to answer an active probe.
+            cfg.scan_time.active.min = 20;
+            cfg.scan_time.active.max = 60;
+            cfg.home_chan_dwell_time = 30;
+        }
 
         if !try_mark_scan_results_pending() {
             log::warn!("WiFi scan already in progress");
