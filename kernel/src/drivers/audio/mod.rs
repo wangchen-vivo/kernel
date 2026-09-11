@@ -12,4 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) mod axp2101;
 pub(crate) mod es8311;
+
+use core::sync::atomic::{AtomicU8, Ordering};
+
+// 0=not attempted, 1=init failed, 2=init ok/verify failed,
+// 3=init and verify succeeded, 4=I2C bus unavailable.
+static ES8311_STATUS: AtomicU8 = AtomicU8::new(0);
+// 0=not attempted, 1=configuration failed, 2=enabled and verified.
+static SPEAKER_POWER_STATUS: AtomicU8 = AtomicU8::new(0);
+
+pub(crate) fn set_es8311_status(status: u8) {
+    ES8311_STATUS.store(status, Ordering::Relaxed);
+}
+
+pub(crate) fn es8311_status() -> u8 {
+    ES8311_STATUS.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_speaker_power_status(status: u8) {
+    SPEAKER_POWER_STATUS.store(status, Ordering::Relaxed);
+}
+
+pub(crate) fn speaker_power_status() -> u8 {
+    SPEAKER_POWER_STATUS.load(Ordering::Relaxed)
+}

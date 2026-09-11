@@ -132,6 +132,9 @@ const PCR_SPI2_CLKM_SEL_MASK: u32 = 0b11 << 20;
 const PCR_SPI2_CLKM_SEL_80M: u32 = 1 << 20;
 const PCR_SPI2_CLKM_EN: u32 = 1 << 22;
 
+static SPI_DMA_ATTEMPTS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct DmaDescriptor {
@@ -377,6 +380,20 @@ impl<const SPI_BASE: usize, const PCR_BASE: usize, const SOURCE_HZ: u32>
         let descriptor_count = Self::prepare_tx_descriptors(&mut descriptors, data);
         debug_assert!(descriptor_count > 0);
 
+        let attempt = SPI_DMA_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if attempt < 8 || attempt % 64 == 0 {
+            log::warn!(
+                "[GDMA-ARB] SPI2_PERI_BEFORE=0x{:02x}",
+                Self::read_gdma_reg(GDMA_OUT_PERI_SEL_CH0)
+            );
+            log::info!(
+                "[GDMA-ARB] SPI2 TX channel=0 attempt={} len={} peri_before=0x{:08x}",
+                attempt,
+                data.len(),
+                Self::read_gdma_reg(GDMA_OUT_PERI_SEL_CH0)
+            );
+        }
+
         Self::write_gdma_reg(GDMA_OUT_INT_CLR_CH0, GDMA_OUT_ALL_INTERRUPTS);
         Self::modify_gdma_reg(GDMA_OUT_CONF0_CH0, 0, GDMA_OUT_RESET);
         Self::modify_gdma_reg(
@@ -387,6 +404,18 @@ impl<const SPI_BASE: usize, const PCR_BASE: usize, const SOURCE_HZ: u32>
         Self::modify_gdma_reg(GDMA_OUT_CONF1_CH0, GDMA_OUT_CHECK_OWNER, 0);
         Self::write_gdma_reg(GDMA_OUT_PRI_CH0, 0);
         Self::write_gdma_reg(GDMA_OUT_PERI_SEL_CH0, GDMA_PERIPHERAL_SPI2);
+
+        if attempt < 8 || attempt % 64 == 0 {
+            log::warn!(
+                "[GDMA-ARB] SPI2_PERI_AFTER=0x{:02x}",
+                Self::read_gdma_reg(GDMA_OUT_PERI_SEL_CH0)
+            );
+            log::info!(
+                "[GDMA-ARB] SPI2 TX channel=0 attempt={} peri_after=0x{:08x}",
+                attempt,
+                Self::read_gdma_reg(GDMA_OUT_PERI_SEL_CH0)
+            );
+        }
 
         compiler_fence(Ordering::SeqCst);
         Self::write_gdma_reg(

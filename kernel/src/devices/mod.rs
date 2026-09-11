@@ -31,6 +31,7 @@ use spin::{Once, RwLock as SpinRwLock};
 pub mod block;
 pub mod bus;
 pub(crate) mod backlight;
+pub(crate) mod audio_volume;
 pub mod clock;
 pub mod console;
 mod error;

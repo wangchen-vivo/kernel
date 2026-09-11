@@ -39,6 +39,7 @@ pub struct GdmaChStatus {
     pub in_link: u32,
     pub in_state: u32,
     pub out_conf0: u32,
+    pub out_peri_sel: u32,
     pub out_link: u32,
     pub out_state: u32,
 }
@@ -63,12 +64,13 @@ impl core::fmt::Display for GdmaStatus {
         for (ch, s) in self.channels.iter().enumerate() {
             write!(
                 f,
-                "CH{} IN[c0=0x{:08x} lk=0x{:08x} st=0x{:08x}] OUT[c0=0x{:08x} lk=0x{:08x} st=0x{:08x}] | ",
+                "CH{} IN[c0=0x{:08x} lk=0x{:08x} st=0x{:08x}] OUT[c0=0x{:08x} peri=0x{:08x} lk=0x{:08x} st=0x{:08x}] | ",
                 ch,
                 s.in_conf0,
                 s.in_link,
                 s.in_state,
                 s.out_conf0,
+                s.out_peri_sel,
                 s.out_link,
                 s.out_state
             )?;
@@ -87,6 +89,7 @@ pub fn capture_gdma_status() -> GdmaStatus {
         in_link: 0,
         in_state: 0,
         out_conf0: 0,
+        out_peri_sel: 0,
         out_link: 0,
         out_state: 0,
     }; 3];
@@ -103,6 +106,7 @@ pub fn capture_gdma_status() -> GdmaStatus {
         let in_link = unsafe { core::ptr::read_volatile((ch_base + 0x10) as *const u32) };
         let in_state = unsafe { core::ptr::read_volatile((ch_base + 0x14) as *const u32) };
         let out_conf0 = unsafe { core::ptr::read_volatile((ch_base + 0x60) as *const u32) };
+        let out_peri_sel = unsafe { core::ptr::read_volatile((ch_base + 0x90) as *const u32) };
         let out_link = unsafe { core::ptr::read_volatile((ch_base + 0x70) as *const u32) };
         let out_state = unsafe { core::ptr::read_volatile((ch_base + 0x74) as *const u32) };
         channels[ch] = GdmaChStatus {
@@ -112,6 +116,7 @@ pub fn capture_gdma_status() -> GdmaStatus {
             in_link,
             in_state,
             out_conf0,
+            out_peri_sel,
             out_link,
             out_state,
         };
@@ -379,6 +384,13 @@ fn wait_for_bit(regs: &IntCluster, mask: u32) -> bool {
 /// be used from a `static` context.
 pub struct Esp32c6GdmaChannel<const CH: usize>;
 
+/// Read the peripheral currently selected for the TX side of channel `CH`.
+/// This is used by diagnostics to detect channel ownership being overwritten
+/// by another peripheral (for example SPI2 and I2S both using channel 0).
+pub fn tx_peripheral<const CH: usize>() -> u32 {
+    channel_regs::<CH>().out_peri_sel.get()
+}
+
 impl<const CH: usize> Esp32c6GdmaChannel<CH> {
     pub const fn new() -> Self {
         assert!(CH < 3, "ESP32-C6 has only 3 GDMA channels");
@@ -399,6 +411,7 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
         global.misc_conf.modify(MiscConf::AHBM_RST_INTER::CLEAR);
         // Force clock on for all DMA registers.
         global.misc_conf.modify(MiscConf::CLK_EN::SET);
+        log::info!("[GDMA] initialized MISC_CONF=0x{:08x}", global.misc_conf.get());
     }
 
     // ---- RX (input: peripheral → memory) ----
@@ -486,6 +499,7 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
     /// descriptor (and its buffer) must remain valid until the transfer
     /// completes.
     pub fn start_tx(desc: &DmaDescriptor) {
+        let ch = channel_regs::<CH>();
         Self::reset_tx();
         // Clear any pending TX interrupt status.
         let int = out_int_regs::<CH>();
@@ -494,7 +508,6 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         // Set the descriptor address and kick off — use modify() to preserve
         // other fields. Do NOT set RESTART — it reuses the *previous* address.
-        let ch = channel_regs::<CH>();
         let desc_addr = (addr_of!(*desc) as usize as u32) & ((1 << 20) - 1);
         ch.out_link.modify(OutLink::OUTLINK_ADDR.val(desc_addr));
         ch.out_link.modify(OutLink::OUTLINK_START::SET);
@@ -520,7 +533,8 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
                 return Err(blueos_hal::err::HalError::Fail);
             }
             if !wait_for_bit(int, OutInt::OUT_TOTAL_EOF.mask | OutInt::OUT_DSCR_ERR.mask) {
-                log::warn!("[GDMA] TX timeout, raw=0x{:08x}", int.raw.get());
+                let status = capture_gdma_status();
+                log::warn!("[GDMA] TX timeout raw=0x{:08x} | {}", int.raw.get(), status);
                 return Err(blueos_hal::err::HalError::Timeout);
             }
         }

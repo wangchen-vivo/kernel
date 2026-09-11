@@ -26,7 +26,9 @@ use blueos_hal::i2s::{I2s, I2sChannelMode, I2sConfig, I2sFormat};
 use blueos_hal::{Configuration, PlatPeri};
 use core::cell::UnsafeCell;
 
-use crate::dma::esp32c6_gdma::{DmaDescriptor, Esp32c6GdmaChannel, PERI_I2S0};
+use crate::dma::esp32c6_gdma::{
+    capture_gdma_status, tx_peripheral, DmaDescriptor, Esp32c6GdmaChannel, PERI_I2S0,
+};
 use crate::static_ref::StaticRef;
 use tock_registers::{
     interfaces::{ReadWriteable, Readable, Writeable},
@@ -34,11 +36,13 @@ use tock_registers::{
     registers::{ReadOnly, ReadWrite, WriteOnly},
 };
 
+static TX_ATTEMPTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// I2S0 peripheral base address on ESP32-C6.
 const I2S0_BASE: usize = 0x6000_C000;
 /// PCR (Peripheral Clock Reset) base address on ESP32-C6.
 const PCR_BASE: usize = 0x6009_6000;
-/// XTAL frequency on ESP32-C6 (40 MHz).
+/// I2S source frequency used by the ES8311 configuration.
 const XTAL_HZ: u32 = 40_000_000;
 
 /// Greatest common divisor (Euclidean algorithm).
@@ -246,34 +250,34 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
             return Err(blueos_hal::err::HalError::NotSupport);
         }
 
-        // half_sample_bits = (slot_width × channels) / 2. The slot width, not
-        // the data width, determines the BCK count per frame — matching the
-        // reference ESP-IDF `I2S_STD_MSB_SLOT_DEFAULT_CONFIG(32, ...)`.
-        // For 32-bit slots × stereo = 32.
-        let half_sample_bits = (slot_width as u32 * channels as u32) / 2;
-        if half_sample_bits == 0 || half_sample_bits > 63 {
+        // half_sample_bits = total_slot * slot_width / 2.
+        // ESP-IDF TDM Philips mode uses total_slot (4), not active channels (2).
+        // For 4 slots × 32-bit = 128, half = 64.
+        let total_slot = 4u32;
+        let half_sample_bits = total_slot * slot_width as u32 / 2;
+        if half_sample_bits == 0 || half_sample_bits > 64 {
             return Err(blueos_hal::err::HalError::NotSupport);
         }
 
-        // BCK = sample_rate * slot_width * channels.
-        let bck_target = sample_rate * slot_width as u32 * channels as u32;
+        // BCK = sample_rate * total_slot * slot_width.
+        let bck_target = sample_rate * total_slot * slot_width as u32;
         let bck_div_num = mclk / bck_target;
         if bck_div_num == 0 || bck_div_num > 64 {
             return Err(blueos_hal::err::HalError::NotSupport);
         }
         let bck_div_field = bck_div_num.saturating_sub(1) & 0x3f;
 
-        // TX clock: select XTAL (0), set divider, enable.
+        // TX/RX clock: select XTAL (0), set divider, enable.
         self.pcr.i2s_tx_clkm_conf.modify(
             PcrI2sClkmConf::I2S_CLKM_DIV_NUM.val(mclk_div & 0xff)
-                + PcrI2sClkmConf::I2S_CLKM_SEL.val(0) // XTAL
+                + PcrI2sClkmConf::I2S_CLKM_SEL.val(0)
                 + PcrI2sClkmConf::I2S_CLKM_EN.val(1),
         );
 
         // RX clock: same, plus MCLK_SEL = 1 (use TX clock for MCLK).
         self.pcr.i2s_rx_clkm_conf.modify(
             PcrI2sClkmConf::I2S_CLKM_DIV_NUM.val(mclk_div & 0xff)
-                + PcrI2sClkmConf::I2S_CLKM_SEL.val(0) // XTAL
+                + PcrI2sClkmConf::I2S_CLKM_SEL.val(0)
                 + PcrI2sClkmConf::I2S_CLKM_EN.val(1)
                 + PcrI2sClkmConf::I2S_MCLK_SEL.val(1),
         );
@@ -281,8 +285,8 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         // Configure the fractional clock divider (PCR.I2S_TX/RX_CLKM_DIV_CONF).
         //
         // The integer divider (I2S_CLKM_DIV_NUM) alone can only produce
-        // f_xtal / N.  For 16 kHz × 256 = 4.096 MHz with a 40 MHz XTAL the
-        // ratio is 625/64 = 9.765625, which is not an integer.  The PCR
+        // f_xtal / N. For 16 kHz × 256 = 4.096 MHz with a 40 MHz XTAL the
+        // ratio is 625/64 = 9.765625, which is not an integer. The PCR
         // fractional divider fills in the sub-integer part so the ES8311
         // receives an exact MCLK that matches a coeff_div[] table entry.
         //
@@ -316,7 +320,8 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
             }
         };
         log::info!(
-            "[I2S] MCLK div: integer={}, fractional=0x{:08x} (target {} Hz)",
+            "[I2S] MCLK source={}Hz sel=0 div: integer={}, fractional=0x{:08x} (target {} Hz)",
+            XTAL_HZ,
             mclk_div,
             div_conf,
             mclk
@@ -325,13 +330,12 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         self.pcr.i2s_rx_clkm_div_conf.set(div_conf);
 
         // Program BCK divider and bit width in CONF1.
-        // BITS_MOD = data bits (16), TDM_CHAN_BITS = slot width (32, matching
-        // the reference `I2S_STD_MSB_SLOT_DEFAULT_CONFIG(32, ...)`).
-        let bits_field = (bits as u32 - 1) & 0x1f;
+        // Match ESP-IDF TDM Philips: 4 slots × 32-bit, data_bit_width = slot_width.
+        // bits_mod = slot_width - 1; half_sample_bits = total_slot * slot_width / 2.
+        let bits_field = (slot_width as u32 - 1) & 0x1f;
+        let total_slot = 4u32;
+        let half_sample_bits = total_slot * slot_width as u32 / 2;
         let hsb_field = (half_sample_bits - 1) & 0x3f;
-
-        // TDM_WS_WIDTH: WS pulse width in BCK periods (half-frame for Philips).
-        // BCK_NO_DLY: BCK not delayed in master mode (Philips standard).
         let tdm_ws_width = (half_sample_bits - 1) & 0x7f;
         let tdm_chan_bits = (slot_width as u32 - 1) & 0x1f;
 
@@ -370,9 +374,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         // TX_TDM_EN: TDM mode (TRM: TDM_EN and PDM_EN cannot be both 0 or both 1).
         // TX_MONO_FST_VLD: first channel data is valid in mono mode.
         // TX_CHAN_MOD=0: two channels, both left and right active (stereo).
-        // SIG_LOOPBACK and TX_STOP_EN are NOT set — the reference example uses
-        // standard I2S mode (BCK/WS output to GPIO, no internal loopback) and
-        // does not set TX_STOP_EN (which can halt TX before data is drained).
+        // Use standard I2S mode (BCK/WS output to GPIO, no internal loopback).
         let mut conf = TxConf::TX_PCM_BYPASS::SET
             + TxConf::TX_TDM_EN::SET
             + TxConf::TX_MONO_FST_VLD::SET
@@ -382,10 +384,10 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         }
         self.registers.tx_conf.write(conf);
 
-        // TDM_CTRL: enable channels 0 and 1, total = 2 channels for stereo.
+        // TDM_CTRL: 4 slots total, slot mask 0xF (SLOT0-3) for stereo.
         let (chan_en, tot_chan) = match cfg.channel_mode {
-            I2sChannelMode::Stereo => (0x3, 2 - 1),
-            I2sChannelMode::Mono => (0x1, 1 - 1),
+            I2sChannelMode::Stereo => (0xF, 4 - 1),
+            I2sChannelMode::Mono => (0x1, 4 - 1),
         };
         self.registers.tx_tdm_ctrl.write(
             TdmCtrl::TDM_CHAN_EN.val(chan_en) + TdmCtrl::TDM_TOT_CHAN_NUM.val(tot_chan),
@@ -416,10 +418,10 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         // RXEOF_NUM: number of RX data words before in_suc_eof fires.
         self.registers.rxeof_num.set(0x40);
 
-        // TDM_CTRL: same as TX.
+        // TDM_CTRL: 4 slots total, slot mask 0xF (SLOT0-3), same as TX.
         let (chan_en, tot_chan) = match cfg.channel_mode {
-            I2sChannelMode::Stereo => (0x3, 2 - 1),
-            I2sChannelMode::Mono => (0x1, 1 - 1),
+            I2sChannelMode::Stereo => (0xF, 4 - 1),
+            I2sChannelMode::Mono => (0x1, 4 - 1),
         };
         self.registers.rx_tdm_ctrl.write(
             TdmCtrl::TDM_CHAN_EN.val(chan_en) + TdmCtrl::TDM_TOT_CHAN_NUM.val(tot_chan),
@@ -540,10 +542,12 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
 
 impl<const TX_CH: usize, const RX_CH: usize> PlatPeri for Esp32c6I2s0<TX_CH, RX_CH> {
     fn enable(&self) {
-        // 1. Enable I2S APB clock + high-pulse reset.
+        // 1. Reset the I2S module (RST_EN=0), then release it (RST_EN=1).
         self.pcr.i2s_conf.set(0);
         self.pcr.i2s_conf.set(PcrI2sConf::I2S_CLK_EN.mask);
-        self.pcr.i2s_conf.set(PcrI2sConf::I2S_CLK_EN.mask | PcrI2sConf::I2S_RST_EN.mask);
+        self.pcr
+            .i2s_conf
+            .set(PcrI2sConf::I2S_CLK_EN.mask | PcrI2sConf::I2S_RST_EN.mask);
 
         // 2. Reset the DMA channels and bind them to I2S0.
         Esp32c6GdmaChannel::<TX_CH>::reset_tx();
@@ -601,8 +605,9 @@ impl<const TX_CH: usize, const RX_CH: usize> Configuration<I2sConfig>
         // FIFO hung timeout — keep the default (0x0810) to avoid stalls.
         self.registers.lc_hung_conf.set(0x0810);
 
-        // Ensure I2S module is not in reset state.
-        self.pcr.i2s_conf
+        // Ensure the I2S module clock remains enabled and reset is released.
+        self.pcr
+            .i2s_conf
             .set(PcrI2sConf::I2S_CLK_EN.mask | PcrI2sConf::I2S_RST_EN.mask);
         log::info!("[I2S] i2s_conf after configure: 0x{:08x}", self.pcr.i2s_conf.get());
 
@@ -622,12 +627,81 @@ impl<const TX_CH: usize, const RX_CH: usize> I2s<I2sConfig, ()>
         let desc = unsafe { &mut *self.tx_desc.get() };
         *desc = DmaDescriptor::for_tx(buf.as_ptr() as *mut u8, buf.len(), true);
 
+        let attempt = TX_ATTEMPTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if attempt < 3 || attempt % 32 == 0 {
+            log::warn!(
+                "[GDMA-ARB] I2S_PERI_BEFORE=0x{:02x}",
+                tx_peripheral::<TX_CH>()
+            );
+            log::info!(
+                "[I2S] TX begin attempt={} len={} buf={:p} desc=0x{:08x} dw0=0x{:08x} tx_conf=0x{:08x} tx_conf1=0x{:08x} tx_tdm=0x{:08x} state=0x{:08x} pcr_tx=0x{:08x} pcr_rx=0x{:08x}",
+                attempt,
+                buf.len(),
+                buf.as_ptr(),
+                core::ptr::addr_of!(*desc) as usize as u32,
+                desc.dw0,
+                self.registers.tx_conf.get(),
+                self.registers.tx_conf1.get(),
+                self.registers.tx_tdm_ctrl.get(),
+                self.registers.state.get(),
+                self.pcr.i2s_tx_clkm_conf.get(),
+                self.pcr.i2s_rx_clkm_conf.get(),
+            );
+            log::info!(
+                "[GDMA-ARB] I2S TX channel={} peri_before={} (expected {})",
+                TX_CH,
+                tx_peripheral::<TX_CH>(),
+                PERI_I2S0
+            );
+        }
+
         // Start DMA and I2S TX.
         Esp32c6GdmaChannel::<TX_CH>::start_tx(desc);
+
+        // The LCD also uses GDMA channel 0. Re-assert the I2S route after the
+        // channel reset, immediately before enabling the I2S TX request.
+        Esp32c6GdmaChannel::<TX_CH>::set_tx_peri(PERI_I2S0);
+        if attempt < 3 || attempt % 32 == 0 {
+            log::info!(
+                "[GDMA-ARB] I2S TX channel={} peri_after_rebind={} (expected {})",
+                TX_CH,
+                tx_peripheral::<TX_CH>(),
+                PERI_I2S0
+            );
+        }
         self.registers.tx_conf.modify(TxConf::TX_START::SET);
+
+        if attempt < 3 || attempt % 32 == 0 {
+            let status = capture_gdma_status();
+            log::info!(
+                "[I2S] TX started attempt={} i2s_int=0x{:08x} tx_conf=0x{:08x} state=0x{:08x} | {}",
+                attempt,
+                self.registers.int_raw.get(),
+                self.registers.tx_conf.get(),
+                self.registers.state.get(),
+                status
+            );
+        }
 
         // Wait for the DMA to finish.
         let result = Esp32c6GdmaChannel::<TX_CH>::wait_tx_done();
+
+        if let Err(error) = result {
+            let status = capture_gdma_status();
+            log::error!(
+                "[I2S] TX failed attempt={} len={} error={:?} i2s_int=0x{:08x} tx_conf=0x{:08x} tx_conf1=0x{:08x} state=0x{:08x} | {}",
+                attempt,
+                buf.len(),
+                error,
+                self.registers.int_raw.get(),
+                self.registers.tx_conf.get(),
+                self.registers.tx_conf1.get(),
+                self.registers.state.get(),
+                status
+            );
+            self.registers.tx_conf.modify(TxConf::TX_START::CLEAR);
+            return Err(error);
+        }
 
         // Stop TX so the next write can restart cleanly.
         self.registers.tx_conf.modify(TxConf::TX_START::CLEAR);
