@@ -373,7 +373,11 @@ where
     }
 }
 
-impl<T: blueos_hal::i2c::I2c<I2cConfig, ()> + 'static> AudioVolumeOps for Es8311Driver<T> {
+impl<T, G> AudioVolumeOps for Es8311Driver<T, G>
+where
+    T: blueos_hal::i2c::I2c<I2cConfig, ()> + 'static,
+    G: blueos_hal::gpio::OutputPin + Send + Sync + 'static,
+{
     fn set_volume(&mut self, value: u8) -> Result<(), embedded_io::ErrorKind> {
         Es8311Driver::set_volume(self, value).map_err(error_to_io_kind)
     }

@@ -1347,16 +1347,19 @@ pub(crate) fn init_i2s() {
         let pa_pin: Option<&'static blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin> =
             None;
 
-        let mut codec = crate::drivers::audio::es8311::Es8311Driver::<
-            blueos_driver::i2c::esp32_i2c::Esp32I2c,
-            blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
-        >::new(i2c_bus, pa_pin, false);
-        if let Err(e) = codec.init() {
+        let codec = alloc::sync::Arc::new(blueos_infra::tinyrwlock::RwLock::new(
+            crate::drivers::audio::es8311::Es8311Driver::<
+                blueos_driver::i2c::esp32_i2c::Esp32I2c,
+                blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+            >::new(i2c_bus, pa_pin, false),
+        ));
+        let init_result = { codec.write().init() };
+        if let Err(e) = init_result {
             kearly_println!("Failed to initialize ES8311 codec: {:?}", e);
             log::warn!("Failed to initialize ES8311 codec: {:?}", e);
         } else {
             kearly_println!("ES8311 codec initialized for playback");
-            let verify_result = codec.write().verify();
+            let verify_result = { codec.write().verify() };
             if let Err(e) = verify_result {
                 crate::drivers::audio::set_es8311_status(2);
                 kearly_println!("ES8311 codec verify failed: {:?}", e);
