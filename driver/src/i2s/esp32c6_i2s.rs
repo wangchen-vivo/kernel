@@ -27,7 +27,8 @@ use blueos_hal::{Configuration, PlatPeri};
 use core::cell::UnsafeCell;
 
 use crate::dma::esp32c6_gdma::{
-    capture_gdma_status, DmaDescriptor, Esp32c6GdmaChannel, PERI_I2S0,
+    out_int_regs, wait_for_bit, DmaDescriptor, Esp32c6GdmaChannel, OutInt, PERI_I2S0, DW0_OWNER_DMA,
+    DW0_SUC_EOF,
 };
 use crate::static_ref::StaticRef;
 use tock_registers::{
@@ -57,6 +58,21 @@ const fn gcd(a: u32, b: u32) -> u32 {
 
 /// Polling iteration cap for DMA wait.
 const POLL_LIMIT: u32 = 10_000_000;
+
+/// TX ring-buffer constants.
+///
+/// The TX path uses a ring of `RING_SIZE` descriptors, each pointing to a
+/// fixed `SEG`-byte buffer. The descriptor `next` pointers form a closed
+/// loop so the DMA engine never stops between segments — eliminating the
+/// audio gap (FIFO underflow) that occurs when DMA halts at chain end and
+/// must be restarted by the CPU.
+///
+/// `RING_SIZE` must be large enough that the CPU can fill segments ahead
+/// of DMA consumption without being blocked. With 16 descriptors × 4080
+/// bytes = ~65 KB ≈ 250 ms at 16 kHz, the CPU has a generous window to
+/// refill consumed segments while DMA is busy with later ones.
+const SEG: usize = 4080;
+const RING_SIZE: usize = 16;
 
 register_bitfields! [
     u32,
@@ -171,6 +187,7 @@ register_structs! {
         (0x70 => _etm_conf),
         (0x74 => _reserved3),
         (0x80 => date: ReadWrite<u32>),
+        //(0xEC => out_eof_bfr_des_addr: ReadOnly<u32, I2sInt::Register>),
         (0x84 => @END),
     }
 }
@@ -193,14 +210,34 @@ register_structs! {
 /// `TX_CH` and `RX_CH` are GDMA channel indices (0, 1, or 2). They must be
 /// distinct if both playback and capture are used simultaneously.
 ///
-/// The driver stores a TX descriptor and RX descriptor internally (single
-/// descriptor per transfer — callers feed buffers chunked to a reasonable
-/// size). The buffers themselves are supplied by the caller and must outlive
-/// the transfer.
+/// ## TX ring buffer
+///
+/// The TX path uses a ring of `RING_SIZE` DMA descriptors forming a closed
+/// loop (`desc[i].next = &desc[i+1]`, `desc[RING_SIZE-1].next = &desc[0]`).
+/// Each descriptor owns a fixed `SEG`-byte buffer. The DMA engine circulates
+/// indefinitely, so there is **zero inter-segment gap** — critical for
+/// glitch-free audio.
+///
+/// The CPU tracks a `write_idx` (next descriptor to fill). A descriptor is
+/// safe to refill once the DMA engine has consumed it — detected by polling
+/// the `owner` bit in `dw0[31]`: DMA clears it to 0 when done, CPU sets it
+/// back to 1 after refilling.
+///
+/// On `drain_and_stop()`, the ring is broken (last descriptor's `next` set
+/// to null) and the CPU waits for `OUT_TOTAL_EOF` before halting.
 pub struct Esp32c6I2s0<const TX_CH: usize, const RX_CH: usize> {
     registers: StaticRef<I2sRegisters>,
     pcr: StaticRef<PcrI2sRegisters>,
-    tx_desc: UnsafeCell<DmaDescriptor>,
+    /// Ring of DMA descriptors forming a closed loop.
+    tx_descs: UnsafeCell<[DmaDescriptor; RING_SIZE]>,
+    /// Per-descriptor buffers (each `SEG` bytes).
+    tx_bufs: UnsafeCell<[[u8; SEG]; RING_SIZE]>,
+    /// CPU write cursor: next descriptor index to fill.
+    write_idx: UnsafeCell<usize>,
+    /// Whether the DMA ring has been started.
+    tx_started: UnsafeCell<bool>,
+    /// Index of the last descriptor filled (for drain).
+    last_write_idx: UnsafeCell<Option<usize>>,
     rx_desc: UnsafeCell<DmaDescriptor>,
 }
 
@@ -214,11 +251,18 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         Self {
             registers: unsafe { StaticRef::new(I2S0_BASE as *const I2sRegisters) },
             pcr: unsafe { StaticRef::new(PCR_BASE as *const PcrI2sRegisters) },
-            tx_desc: UnsafeCell::new(DmaDescriptor {
-                dw0: 0,
-                buffer: core::ptr::null_mut(),
-                next: core::ptr::null_mut(),
+            tx_descs: UnsafeCell::new({
+                const NULL_DESC: DmaDescriptor = DmaDescriptor {
+                    dw0: 0,
+                    buffer: core::ptr::null_mut(),
+                    next: core::ptr::null_mut(),
+                };
+                [NULL_DESC; RING_SIZE]
             }),
+            tx_bufs: UnsafeCell::new([[0u8; SEG]; RING_SIZE]),
+            write_idx: UnsafeCell::new(0),
+            tx_started: UnsafeCell::new(false),
+            last_write_idx: UnsafeCell::new(None),
             rx_desc: UnsafeCell::new(DmaDescriptor {
                 dw0: 0,
                 buffer: core::ptr::null_mut(),
@@ -249,7 +293,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         }
 
         // half_sample_bits = total_slot * slot_width / 2.
-        // ESP-IDF TDM Philips mode uses total_slot (4), not active channels (2).
+        // ESP-IDF TDM mode uses total_slot (4) instead of active channels (2).
         // For 4 slots × 32-bit = 128, half = 64.
         let total_slot = 4u32;
         let half_sample_bits = total_slot * slot_width as u32 / 2;
@@ -283,8 +327,8 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         // Configure the fractional clock divider (PCR.I2S_TX/RX_CLKM_DIV_CONF).
         //
         // The integer divider (I2S_CLKM_DIV_NUM) alone can only produce
-        // f_xtal / N. For 16 kHz × 256 = 4.096 MHz with a 40 MHz XTAL the
-        // ratio is 625/64 = 9.765625, which is not an integer. The PCR
+        // f_xtal / N.  For 16 kHz × 256 = 4.096 MHz with a 40 MHz XTAL the
+        // ratio is 625/64 = 9.765625, which is not an integer.  The PCR
         // fractional divider fills in the sub-integer part so the ES8311
         // receives an exact MCLK that matches a coeff_div[] table entry.
         //
@@ -318,8 +362,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
             }
         };
         log::info!(
-            "[I2S] MCLK source={}Hz sel=0 div: integer={}, fractional=0x{:08x} (target {} Hz)",
-            XTAL_HZ,
+            "[I2S] MCLK div: integer={}, fractional=0x{:08x} (target {} Hz)",
             mclk_div,
             div_conf,
             mclk
@@ -328,8 +371,11 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         self.pcr.i2s_rx_clkm_div_conf.set(div_conf);
 
         // Program BCK divider and bit width in CONF1.
-        // Match ESP-IDF TDM Philips: 4 slots × 32-bit, data_bit_width = slot_width.
-        // bits_mod = slot_width - 1; half_sample_bits = total_slot * slot_width / 2.
+        // Match ESP-IDF TDM Philips: 4 slots × 32-bit, data_bit_width=32.
+        // bits_mod = data_bit_width - 1 = 31
+        // half_sample_bits = total_slot * slot_width / 2 = 4 * 32 / 2 = 64 → 63
+        // tdm_ws_width = half_sample_bits - 1 = 63 (AUTO = total_slot*slot_bits/2)
+        // tdm_chan_bits = slot_width - 1 = 31
         let bits_field = (slot_width as u32 - 1) & 0x1f;
         let total_slot = 4u32;
         let half_sample_bits = total_slot * slot_width as u32 / 2;
@@ -337,7 +383,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         let tdm_ws_width = (half_sample_bits - 1) & 0x7f;
         let tdm_chan_bits = (slot_width as u32 - 1) & 0x1f;
 
-        // TX_CONF1: BCK_DIV_NUM | BITS_MOD | HALF_SAMPLE_BITS | MSB_SHIFT (Philips).
+        // TX_CONF1: BCK_DIV_NUM | BITS_MOD | HALF_SAMPLE_BITS | MSB_SHIFT | BCK_NO_DLY.
         self.registers.tx_conf1.write(
             Conf1::TDM_WS_WIDTH.val(tdm_ws_width)
                 + Conf1::BCK_DIV_NUM.val(bck_div_field)
@@ -368,11 +414,8 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
     /// The actual TX/RX unit and FIFO reset happens in `configure()` after
     /// `tx_update()`, not here.
     fn configure_tx(&self, cfg: &I2sConfig) {
-        // Build TX_CONF value — matches the reference ESP-IDF I2S std mode.
-        // TX_TDM_EN: TDM mode (TRM: TDM_EN and PDM_EN cannot be both 0 or both 1).
-        // TX_MONO_FST_VLD: first channel data is valid in mono mode.
-        // TX_CHAN_MOD=0: two channels, both left and right active (stereo).
-        // Use standard I2S mode (BCK/WS output to GPIO, no internal loopback).
+        // TDM mode: TX_TDM_EN=1, TX_PDM_EN=0 (i2s_ll_tx_enable_tdm).
+        // TX_PCM_BYPASS=1, TX_MONO_FST_VLD=1, TX_CHAN_MOD=0 (stereo).
         let mut conf = TxConf::TX_PCM_BYPASS::SET
             + TxConf::TX_TDM_EN::SET
             + TxConf::TX_MONO_FST_VLD::SET
@@ -382,7 +425,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         }
         self.registers.tx_conf.write(conf);
 
-        // TDM_CTRL: 4 slots total, slot mask 0xF (SLOT0-3) for stereo.
+        // TDM_CTRL: 4 slots total, slot mask 0xF (SLOT0-3).
         let (chan_en, tot_chan) = match cfg.channel_mode {
             I2sChannelMode::Stereo => (0xF, 4 - 1),
             I2sChannelMode::Mono => (0x1, 4 - 1),
@@ -398,12 +441,8 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
     /// The actual TX/RX unit and FIFO reset happens in `configure()` after
     /// `rx_update()`, not here.
     fn configure_rx(&self, cfg: &I2sConfig) {
-        // RX_TDM_EN: TDM mode (TRM: TDM_EN and PDM_EN cannot be both 0 or both 1).
-        // RX_MONO_FST_VLD: first channel data is valid in mono mode.
-        // RX_STOP_MODE=2: stop when RX_START=0 or RX FIFO is full.
-        // RX_SLAVE_MOD is NOT set — it was only needed for SIG_LOOPBACK mode
-        // where RX shared TX's clocks internally. In standard I2S mode RX
-        // generates its own BCK/WS (or follows the master externally).
+        // TDM mode: RX_TDM_EN=1, RX_PDM_EN=0 (i2s_ll_rx_enable_tdm).
+        // RX_PCM_BYPASS=1, RX_MONO_FST_VLD=1, RX_STOP_MODE=2.
         let mut conf = RxConf::RX_PCM_BYPASS::SET
             + RxConf::RX_TDM_EN::SET
             + RxConf::RX_MONO_FST_VLD::SET
@@ -416,7 +455,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         // RXEOF_NUM: number of RX data words before in_suc_eof fires.
         self.registers.rxeof_num.set(0x40);
 
-        // TDM_CTRL: 4 slots total, slot mask 0xF (SLOT0-3), same as TX.
+        // TDM_CTRL: 4 slots total, slot mask 0xF (SLOT0-3).
         let (chan_en, tot_chan) = match cfg.channel_mode {
             I2sChannelMode::Stereo => (0xF, 4 - 1),
             I2sChannelMode::Mono => (0x1, 4 - 1),
@@ -449,6 +488,59 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         }
     }
 
+    /// Busy-poll until descriptor `idx` is safe to refill.
+    ///
+    /// With `OUT_AUTO_WRBACK=1`, the DMA engine clears `dw0[31]` (owner bit)
+    /// to 0 after consuming a TX descriptor. We spin until that bit reads 0,
+    /// meaning the DMA has finished with this descriptor and its buffer is
+    /// safe to overwrite.
+    ///
+    /// Uses `read_volatile` on every iteration to bypass compiler caching.
+    fn wait_desc_safe(&self, idx: usize) {
+        let descs = unsafe { &*self.tx_descs.get() };
+        let desc_ptr = core::ptr::addr_of!(descs[idx].dw0) as *const u32;
+        let mut spin = 0u32;
+        loop {
+            let dw0 = unsafe { core::ptr::read_volatile(desc_ptr) };
+            if dw0 & DW0_OWNER_DMA == 0 {
+                return;
+            }
+            spin += 1;
+            if spin % 1_000_000 == 0 {
+                log::warn!(
+                    "[I2S] wait_desc_safe({}) still pending after {} spins, dw0=0x{:08x}",
+                    idx, spin, dw0,
+                );
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Check if the DMA engine is paused and restart it if so.
+    ///
+    /// With `OUT_AUTO_WRBACK=1`, the DMA pauses when it encounters a
+    /// descriptor whose owner bit is 0 (already consumed, not yet refilled).
+    /// We read `OUTLINK_DSCR_ADDR` from `OUT_STATE` to find the DMA's current
+    /// position, check that descriptor's owner bit, and if it's 0, issue
+    /// `OUTLINK_RESTART` to resume the DMA from that descriptor.
+    fn restart_if_paused(&self) {
+        let descs = unsafe { &*self.tx_descs.get() };
+        let base = (core::ptr::addr_of!(descs[0]) as usize) & 0x3_ffff;
+        let desc_size = core::mem::size_of::<DmaDescriptor>();
+        let dma_addr = Esp32c6GdmaChannel::<TX_CH>::read_outlink_dscr_addr() as usize;
+        if dma_addr < base {
+            return;
+        }
+        let dma_idx = (dma_addr - base) / desc_size;
+        if dma_idx >= RING_SIZE {
+            return;
+        }
+        let owner = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(descs[dma_idx].dw0) as *const u32) };
+        if owner & DW0_OWNER_DMA == 0 {
+            Esp32c6GdmaChannel::<TX_CH>::restart_tx();
+        }
+    }
+
     /// Simultaneous TX/RX transfer for loopback testing.
     ///
     /// Starts RX DMA first, then TX DMA, so no incoming samples are lost.
@@ -477,7 +569,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         log::info!("[I2S_TEST] re-configure done");
 
         // Prepare TX descriptor: single descriptor, suc_eof = true.
-        let tx_desc = unsafe { &mut *self.tx_desc.get() };
+        let tx_desc = unsafe { &mut (*self.tx_descs.get())[0] };
         *tx_desc = DmaDescriptor::for_tx(tx_buf.as_ptr() as *mut u8, tx_buf.len(), true);
 
         // Prepare RX descriptor.
@@ -552,6 +644,13 @@ impl<const TX_CH: usize, const RX_CH: usize> PlatPeri for Esp32c6I2s0<TX_CH, RX_
         Esp32c6GdmaChannel::<TX_CH>::set_tx_peri(PERI_I2S0);
         Esp32c6GdmaChannel::<RX_CH>::reset_rx();
         Esp32c6GdmaChannel::<RX_CH>::set_rx_peri(PERI_I2S0);
+
+        // 3. Reset ring-buffer bookkeeping.
+        unsafe {
+            *self.write_idx.get() = 0;
+            *self.tx_started.get() = false;
+            *self.last_write_idx.get() = None;
+        }
     }
     fn disable(&self) {
         // Stop TX/RX.
@@ -621,41 +720,98 @@ impl<const TX_CH: usize, const RX_CH: usize> I2s<I2sConfig, ()>
             return Ok(());
         }
 
-        // Prepare the TX descriptor: single descriptor, suc_eof = true.
-        let desc = unsafe { &mut *self.tx_desc.get() };
-        *desc = DmaDescriptor::for_tx(buf.as_ptr() as *mut u8, buf.len(), true);
-
-        // Start DMA and I2S TX.
-        Esp32c6GdmaChannel::<TX_CH>::start_tx(desc);
-
-        // The LCD also uses GDMA channel 0. Re-assert the I2S route after the
-        // channel reset, immediately before enabling the I2S TX request.
-        Esp32c6GdmaChannel::<TX_CH>::set_tx_peri(PERI_I2S0);
-        self.registers.tx_conf.modify(TxConf::TX_START::SET);
-
-        // Wait for the DMA to finish.
-        let result = Esp32c6GdmaChannel::<TX_CH>::wait_tx_done();
-
-        if let Err(error) = result {
-            let status = capture_gdma_status();
-            log::error!(
-                "[I2S] TX failed len={} error={:?} i2s_int=0x{:08x} tx_conf=0x{:08x} tx_conf1=0x{:08x} state=0x{:08x} | {}",
-                buf.len(),
-                error,
-                self.registers.int_raw.get(),
-                self.registers.tx_conf.get(),
-                self.registers.tx_conf1.get(),
-                self.registers.state.get(),
-                status
-            );
-            self.registers.tx_conf.modify(TxConf::TX_START::CLEAR);
-            return Err(error);
+        let max_capacity = SEG * RING_SIZE;
+        if buf.len() > max_capacity {
+            return Err(blueos_hal::err::HalError::InvalidParam);
         }
 
-        // Stop TX so the next write can restart cleanly.
-        self.registers.tx_conf.modify(TxConf::TX_START::CLEAR);
+        let total_len = buf.len();
+        let num_segs = (total_len + SEG - 1) / SEG;
+        let descs = unsafe { &mut *self.tx_descs.get() };
+        let bufs = unsafe { &mut *self.tx_bufs.get() };
 
-        result
+        let started = unsafe { *self.tx_started.get() };
+
+        if !started {
+            // First write: initialize the full ring.
+            // Fill desc[0..num_segs] with real audio data, desc[num_segs..RING_SIZE]
+            // with silence (zeros). All descriptors form a closed loop so the DMA
+            // engine circulates indefinitely. With OUT_AUTO_WRBACK=1, DMA clears
+            // the owner bit after consuming each descriptor, and pauses when it
+            // reaches an owner=0 descriptor (until CPU refills and restarts).
+            let mut widx = 0usize;
+            for i in 0..num_segs {
+                let off = i * SEG;
+                let len = SEG.min(total_len - off);
+                bufs[widx][..len].copy_from_slice(&buf[off..off + len]);
+                let next_idx = (widx + 1) % RING_SIZE;
+                descs[widx] = DmaDescriptor::for_tx(bufs[widx].as_mut_ptr(), len, true);
+                descs[widx].next = core::ptr::addr_of_mut!(descs[next_idx]);
+                widx = next_idx;
+            }
+            // Fill remaining slots with silence so DMA has valid data to play
+            // while CPU prepares the next write.
+            for i in num_segs..RING_SIZE {
+                bufs[i].fill(0);
+                let next_idx = (i + 1) % RING_SIZE;
+                descs[i] = DmaDescriptor::for_tx(bufs[i].as_mut_ptr(), SEG, true);
+                descs[i].next = core::ptr::addr_of_mut!(descs[next_idx]);
+            }
+
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+            unsafe {
+                *self.write_idx.get() = 0;
+                *self.last_write_idx.get() = Some((num_segs - 1) % RING_SIZE);
+            }
+
+            // Start the DMA ring.
+            Esp32c6GdmaChannel::<TX_CH>::clear_out_eof();
+            Esp32c6GdmaChannel::<TX_CH>::clear_out_total_eof();
+            Esp32c6GdmaChannel::<TX_CH>::start_tx_no_reset(&descs[0]);
+            self.registers.tx_conf.modify(TxConf::TX_START::SET);
+            unsafe {
+                *self.tx_started.get() = true;
+            }
+            return Ok(());
+        }
+
+        // Subsequent writes: refill consumed descriptors one by one.
+        // With OUT_AUTO_WRBACK=1, DMA clears owner bit after consuming each
+        // descriptor, and pauses when it hits an owner=0 descriptor.
+        // We poll the owner bit, refill, set owner=1, then restart if paused.
+        let mut widx = unsafe { *self.write_idx.get() };
+        for i in 0..num_segs {
+            let off = i * SEG;
+            let len = SEG.min(total_len - off);
+
+            // Wait until DMA has consumed this descriptor (owner bit cleared).
+            self.wait_desc_safe(widx);
+
+            // Refill the buffer.
+            bufs[widx][..len].copy_from_slice(&buf[off..off + len]);
+
+            // Rebuild the descriptor: set size, length, suc_eof, and owner=DMA.
+            let size = (len as u32) & 0xfff;
+            let length = (len as u32) << 12;
+            descs[widx].dw0 = size | length | DW0_SUC_EOF | DW0_OWNER_DMA;
+            // next pointer is already correct (closed loop).
+
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+            widx = (widx + 1) % RING_SIZE;
+        }
+
+        // DMA may have paused on an owner=0 descriptor while we were refilling.
+        // Check and restart if needed.
+        self.restart_if_paused();
+
+        unsafe {
+            *self.write_idx.get() = widx;
+            *self.last_write_idx.get() = Some((widx + RING_SIZE - 1) % RING_SIZE);
+        }
+
+        Ok(())
     }
 
     fn read(&self, buf: &mut [u8]) -> blueos_hal::err::Result<()> {
@@ -674,5 +830,60 @@ impl<const TX_CH: usize, const RX_CH: usize> I2s<I2sConfig, ()>
         self.registers.rx_conf.modify(RxConf::RX_START::CLEAR);
 
         result
+    }
+
+    fn drain_and_stop(&self) -> blueos_hal::err::Result<()> {
+        // Only drain if the ring was actually started.
+        if !unsafe { *self.tx_started.get() } {
+            return Ok(());
+        }
+
+        let last_idx = match unsafe { *self.last_write_idx.get() } {
+            Some(idx) => idx,
+            None => return Ok(()),
+        };
+
+        let descs = unsafe { &mut *self.tx_descs.get() };
+
+        // Break the ring: the last-filled descriptor's `next` becomes null,
+        // so the DMA engine will halt after consuming it (OUT_TOTAL_EOF).
+        descs[last_idx].next = core::ptr::null_mut();
+        descs[last_idx].dw0 |= DW0_SUC_EOF; // ensure suc_eof=1
+
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        // Busy-poll until DMA consumes the last descriptor and halts.
+        // OUT_TOTAL_EOF fires when DMA finishes a descriptor whose next=null.
+        loop {
+            if Esp32c6GdmaChannel::<TX_CH>::is_out_total_eof() {
+                break;
+            }
+            // Check for descriptor errors via the raw register.
+            let int = out_int_regs::<TX_CH>();
+            if !wait_for_bit(int, OutInt::OUT_TOTAL_EOF.mask | OutInt::OUT_DSCR_ERR.mask) {
+                log::warn!("[I2S] drain: TX timeout");
+                return Err(blueos_hal::err::HalError::Timeout);
+            }
+        }
+
+        // Stop I2S TX.
+        self.registers.tx_conf.modify(TxConf::TX_START::CLEAR);
+
+        // Clear interrupt flags.
+        Esp32c6GdmaChannel::<TX_CH>::clear_out_total_eof();
+        Esp32c6GdmaChannel::<TX_CH>::clear_out_eof();
+
+        // Restore the ring link for future playback.
+        let next_idx = (last_idx + 1) % RING_SIZE;
+        descs[last_idx].next = core::ptr::addr_of_mut!(descs[next_idx]);
+
+        // Reset ring bookkeeping.
+        unsafe {
+            *self.write_idx.get() = 0;
+            *self.tx_started.get() = false;
+            *self.last_write_idx.get() = None;
+        }
+
+        Ok(())
     }
 }

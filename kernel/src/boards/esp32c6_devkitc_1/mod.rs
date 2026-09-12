@@ -1090,6 +1090,7 @@ crate::define_pin_states!(
         false,
         false
     ),
+    // DOUT (TX data) output on GPIO23 — ES8311 DIN pin.
     #[cfg(i2s)]
     (
         blueos_kconfig::CONFIG_I2S_DOUT_GPIO as u8,
@@ -1098,21 +1099,22 @@ crate::define_pin_states!(
         false,
         false,
         2,
-        Some(15), // I2SO_SD output signal (DOUT)
-        None,     // DOUT is output-only
+        Some(15),   // I2SO_SD output signal (DOUT)
+        None,       // DOUT is output-only
         false,
         false
     ),
+    // DIN (RX data) input on GPIO21 — ES8311 DOUT pin.
     #[cfg(i2s)]
     (
         blueos_kconfig::CONFIG_I2S_DIN_GPIO as u8,
         1,
-        true, // input enable
+        true,       // ie = true: input enable
         false,
         false,
         2,
-        None,     // DIN is input-only
-        Some(15), // I2SI_SD input signal (DIN)
+        None,       // DIN is input-only
+        Some(15),   // I2SI_SD input signal
         false,
         false
     ),
@@ -1330,26 +1332,34 @@ pub(crate) fn init_i2s() {
     // Power the speaker amplifier and initialize the ES8311 codec via I2C0.
     // This must happen after the I2C bus is up and the I2S clocks are running.
     if let Ok(i2c_bus) = init_i2c0_bus() {
-        if let Err(e) = crate::drivers::audio::axp2101::enable_speaker_power(i2c_bus) {
-            crate::drivers::audio::set_speaker_power_status(1);
-            kearly_println!("Failed to enable AXP2101 speaker power: {:?}", e);
-            log::warn!("Failed to enable AXP2101 speaker power: {:?}", e);
-        } else {
-            crate::drivers::audio::set_speaker_power_status(2);
-            kearly_println!("AXP2101 speaker power enabled");
-        }
+        // PA control: the Waveshare ESP32-C6 Touch AMOLED 2.16 board config
+        // sets pa:-1 (no external PA), so we pass None here. To enable PA
+        // control, enable CONFIG_ES8311_PA and set CONFIG_ES8311_PA_GPIO.
+        #[cfg(es8311_pa)]
+        static ES8311_PA_PIN: blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin =
+            blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
+                blueos_kconfig::CONFIG_ES8311_PA_GPIO as u8,
+            );
+        #[cfg(es8311_pa)]
+        let pa_pin: Option<&'static blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin> =
+            Some(&ES8311_PA_PIN);
+        #[cfg(not(es8311_pa))]
+        let pa_pin: Option<&'static blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin> =
+            None;
 
         let codec = alloc::sync::Arc::new(blueos_infra::tinyrwlock::RwLock::new(
-            crate::drivers::audio::es8311::Es8311Driver::new(i2c_bus),
+            crate::drivers::audio::es8311::Es8311Driver::<
+                blueos_driver::i2c::esp32_i2c::Esp32I2c,
+                blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+            >::new(i2c_bus, pa_pin, false),
         ));
-        let init_result = codec.write().init();
+        let init_result = { codec.write().init() };
         if let Err(e) = init_result {
-            crate::drivers::audio::set_es8311_status(1);
             kearly_println!("Failed to initialize ES8311 codec: {:?}", e);
             log::warn!("Failed to initialize ES8311 codec: {:?}", e);
         } else {
             kearly_println!("ES8311 codec initialized for playback");
-            let verify_result = codec.write().verify();
+            let verify_result = { codec.write().verify() };
             if let Err(e) = verify_result {
                 crate::drivers::audio::set_es8311_status(2);
                 kearly_println!("ES8311 codec verify failed: {:?}", e);
