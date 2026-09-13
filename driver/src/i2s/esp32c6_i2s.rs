@@ -67,12 +67,14 @@ const POLL_LIMIT: u32 = 10_000_000;
 /// audio gap (FIFO underflow) that occurs when DMA halts at chain end and
 /// must be restarted by the CPU.
 ///
-/// `RING_SIZE` must be large enough that the CPU can fill segments ahead
-/// of DMA consumption without being blocked. With 16 descriptors × 4080
-/// bytes = ~65 KB ≈ 250 ms at 16 kHz, the CPU has a generous window to
-/// refill consumed segments while DMA is busy with later ones.
+/// `RING_SIZE` must cover the worst-case CPU stall (e.g. a full-screen UI
+/// refresh, 125-163 ms) so the DMA engine has audio to play while the CPU
+/// is blocked. Writes are synchronous (`wait_desc_safe` blocks until DMA
+/// consumes each descriptor), so a depth of ~255 ms matches the original
+/// buffering behavior at half the static memory cost (32 KiB instead of
+/// 64 KiB, memory that would otherwise be carved out of the heap).
 const SEG: usize = 4080;
-const RING_SIZE: usize = 16;
+const RING_SIZE: usize = 8;
 
 register_bitfields! [
     u32,
