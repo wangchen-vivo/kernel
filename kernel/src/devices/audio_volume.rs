@@ -36,6 +36,12 @@ pub trait AudioVolumeOps {
 
     /// Return the current DAC volume value.
     fn volume(&mut self) -> Result<u8, ErrorKind>;
+
+    /// Soft-mute (true) or unmute (false) the DAC output. Default no-op so
+    /// drivers without a dedicated mute register are unaffected.
+    fn set_mute(&mut self, _mute: bool) -> Result<(), ErrorKind> {
+        Ok(())
+    }
 }
 
 /// Character device that exposes audio volume as a readable/writable decimal
@@ -99,6 +105,29 @@ impl<T: AudioVolumeOps> Device for AudioVolumeDevice<T> {
     fn write(&self, _pos: u64, buf: &[u8], _is_blocking: bool) -> Result<usize, ErrorKind> {
         if buf.is_empty() {
             return Ok(0);
+        }
+
+        // Trim leading/trailing ASCII whitespace for command matching.
+        fn trim<'a>(b: &'a [u8]) -> &'a [u8] {
+            let s = b.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(b.len());
+            let e = b.iter().rposition(|c| !c.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(s);
+            &b[s..e]
+        }
+        let cmd = trim(buf);
+
+        // ASCII case-insensitive equality (no allocation).
+        fn eq_ci(a: &[u8], word: &[u8]) -> bool {
+            a.len() == word.len()
+                && a.iter().zip(word).all(|(x, y)| x.eq_ignore_ascii_case(y))
+        }
+
+        if eq_ci(cmd, b"mute") {
+            self.ops.write().set_mute(true)?;
+            return Ok(buf.len());
+        }
+        if eq_ci(cmd, b"unmute") {
+            self.ops.write().set_mute(false)?;
+            return Ok(buf.len());
         }
 
         // Parse leading decimal digits from the buffer (trim whitespace/newlines).

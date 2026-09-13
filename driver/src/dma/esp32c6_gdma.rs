@@ -500,7 +500,6 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
     /// descriptor (and its buffer) must remain valid until the transfer
     /// completes.
     pub fn start_tx(desc: &DmaDescriptor) {
-        let ch = channel_regs::<CH>();
         Self::reset_tx();
         // Clear any pending TX interrupt status.
         let int = out_int_regs::<CH>();

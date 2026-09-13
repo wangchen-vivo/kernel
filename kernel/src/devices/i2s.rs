@@ -19,16 +19,13 @@
 
 use crate::devices::{Device, DeviceClass, DeviceId, DeviceManager};
 use alloc::{string::String, sync::Arc};
-use blueos_hal::{
-    i2s::{I2s, I2sConfig},
-    Configuration, PlatPeri,
-};
+use blueos_hal::i2s::{I2s, I2sConfig};
+use blueos_hal::{Configuration, PlatPeri};
 use embedded_io::ErrorKind;
 
 pub struct I2sDevice<D: 'static> {
     driver: &'static D,
     configured: core::sync::atomic::AtomicBool,
-    codec_status_reported: core::sync::atomic::AtomicBool,
 }
 
 impl<D> I2sDevice<D>
@@ -39,7 +36,6 @@ where
         Self {
             driver,
             configured: core::sync::atomic::AtomicBool::new(false),
-            codec_status_reported: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -63,26 +59,6 @@ where
             .store(true, core::sync::atomic::Ordering::Relaxed);
         log::info!("[I2S_DEVICE] configure complete; configured=true");
         Ok(())
-    }
-
-    fn report_codec_status(&self) {
-        if !self
-            .codec_status_reported
-            .swap(true, core::sync::atomic::Ordering::Relaxed)
-        {
-            match crate::drivers::audio::speaker_power_status() {
-                1 => log::error!("[AUDIO] speaker power=failed"),
-                2 => log::info!("[AUDIO] speaker power=enabled"),
-                _ => log::error!("[AUDIO] speaker power=not-attempted"),
-            }
-            match crate::drivers::audio::es8311_status() {
-                1 => log::error!("[AUDIO] ES8311 init=failed"),
-                2 => log::error!("[AUDIO] ES8311 init=ok verify=failed"),
-                3 => log::info!("[AUDIO] ES8311 init=ok verify=ok"),
-                4 => log::error!("[AUDIO] ES8311 init=skipped i2c=unavailable"),
-                _ => log::error!("[AUDIO] ES8311 init=not-attempted"),
-            }
-        }
     }
 }
 
@@ -115,7 +91,6 @@ where
     }
 
     fn write(&self, _pos: u64, buf: &[u8], _is_nonblocking: bool) -> Result<usize, ErrorKind> {
-        self.report_codec_status();
         self.ensure_configured()?;
         self.driver
             .write(buf)

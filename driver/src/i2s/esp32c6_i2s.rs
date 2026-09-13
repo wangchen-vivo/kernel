@@ -41,7 +41,7 @@ use tock_registers::{
 const I2S0_BASE: usize = 0x6000_C000;
 /// PCR (Peripheral Clock Reset) base address on ESP32-C6.
 const PCR_BASE: usize = 0x6009_6000;
-/// I2S source frequency used by the ES8311 configuration.
+/// XTAL frequency on ESP32-C6 (40 MHz).
 const XTAL_HZ: u32 = 40_000_000;
 
 /// Greatest common divisor (Euclidean algorithm).
@@ -309,17 +309,17 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         }
         let bck_div_field = bck_div_num.saturating_sub(1) & 0x3f;
 
-        // TX/RX clock: select XTAL (0), set divider, enable.
+        // TX clock: select XTAL (0), set divider, enable.
         self.pcr.i2s_tx_clkm_conf.modify(
             PcrI2sClkmConf::I2S_CLKM_DIV_NUM.val(mclk_div & 0xff)
-                + PcrI2sClkmConf::I2S_CLKM_SEL.val(0)
+                + PcrI2sClkmConf::I2S_CLKM_SEL.val(0) // XTAL
                 + PcrI2sClkmConf::I2S_CLKM_EN.val(1),
         );
 
         // RX clock: same, plus MCLK_SEL = 1 (use TX clock for MCLK).
         self.pcr.i2s_rx_clkm_conf.modify(
             PcrI2sClkmConf::I2S_CLKM_DIV_NUM.val(mclk_div & 0xff)
-                + PcrI2sClkmConf::I2S_CLKM_SEL.val(0)
+                + PcrI2sClkmConf::I2S_CLKM_SEL.val(0) // XTAL
                 + PcrI2sClkmConf::I2S_CLKM_EN.val(1)
                 + PcrI2sClkmConf::I2S_MCLK_SEL.val(1),
         );
@@ -765,7 +765,14 @@ impl<const TX_CH: usize, const RX_CH: usize> I2s<I2sConfig, ()>
                 *self.last_write_idx.get() = Some((num_segs - 1) % RING_SIZE);
             }
 
-            // Start the DMA ring.
+            // Start the DMA ring. This is the first chunk of a new playback
+            // session (tx_started was false), so the channel may carry a
+            // lingering outlink FSM state from the previous session's
+            // drain_and_stop. Reset the TX FSM/FIFO here so OUTLINK_START
+            // begins from a clean descriptor; subsequent chunks within the
+            // same session still skip the reset (via start_tx_no_reset) to
+            // avoid FIFO underflow gaps.
+            Esp32c6GdmaChannel::<TX_CH>::reset_tx();
             Esp32c6GdmaChannel::<TX_CH>::clear_out_eof();
             Esp32c6GdmaChannel::<TX_CH>::clear_out_total_eof();
             Esp32c6GdmaChannel::<TX_CH>::start_tx_no_reset(&descs[0]);

@@ -861,8 +861,7 @@ crate::define_bus! {
     ),
 }
 
-#[cfg(any(co5300, cst9220, sd_card))]
-#[cfg(any(co5300, cst9220, i2s))]
+#[cfg(any(co5300, cst9220, sd_card, i2s))]
 crate::define_pin_states!(
     blueos_driver::pinctrl::esp32c6_pinctrl::Esp32c6IoMuxPinctrl,
     #[cfg(co5300)]
@@ -1050,7 +1049,10 @@ crate::define_pin_states!(
         false
     ),
     // I2S0 pins for ES8311 audio codec (Waveshare ESP32-C6 Touch AMOLED 2.16).
-    // MCLK output on GPIO19, BCLK output on GPIO20, WS output on GPIO22.
+    // MCLK output on GPIO19, BCLK output on GPIO20, WS output on GPIO22,
+    // DOUT (TX data) output on GPIO23.
+    // For loopback testing, DOUT (I2SO_SD, signal 15) and DIN (I2SI_SD, signal 15)
+    // are both routed to GPIO23, so TX data loops back into RX via the GPIO matrix.
     #[cfg(i2s)]
     (
         blueos_kconfig::CONFIG_I2S_MCLK_GPIO as u8,
@@ -1059,7 +1061,7 @@ crate::define_pin_states!(
         false,
         false,
         2,
-        Some(12), // I2S_MCLK output signal
+        Some(12),  // I2S_MCLK output signal
         None,
         false,
         false
@@ -1072,7 +1074,7 @@ crate::define_pin_states!(
         false,
         false,
         2,
-        Some(13), // I2SO_BCK output signal
+        Some(13),  // I2SO_BCK output signal
         None,
         false,
         false
@@ -1085,7 +1087,7 @@ crate::define_pin_states!(
         false,
         false,
         2,
-        Some(14), // I2SO_WS output signal
+        Some(14),  // I2SO_WS output signal
         None,
         false,
         false
@@ -1120,8 +1122,7 @@ crate::define_pin_states!(
     ),
 );
 
-#[cfg(not(any(co5300, cst9220, sd_card)))]
-#[cfg(not(any(co5300, cst9220, i2s)))]
+#[cfg(not(any(co5300, cst9220, sd_card, i2s)))]
 crate::define_pin_states!(None);
 
 pub const BLOCK_STORAGE_DEVICE_NAME: &str = "sdcard-storage";
@@ -1279,9 +1280,10 @@ pub(crate) fn init_i2c_bus() {
 
 #[cfg(i2s)]
 pub(crate) fn init_i2s() {
-    use crate::devices::{i2c_core::block_i2c::BlockI2c, i2s::I2sDevice};
-    use blueos_driver::dma::esp32c6_gdma::Esp32c6GdmaChannel;
+    use crate::devices::i2s::I2sDevice;
+    use crate::devices::i2c_core::block_i2c::BlockI2c;
     use blueos_hal::PlatPeri;
+    use blueos_driver::dma::esp32c6_gdma::Esp32c6GdmaChannel;
 
     // Initialize the GDMA controller before any DMA user (I2S, M2M test).
     // This enables the DMA register clock and resets the AHB master FSM.
@@ -1329,7 +1331,7 @@ pub(crate) fn init_i2s() {
         kearly_println!("GDMA test device registered as /dev/gdma_test");
     }
 
-    // Power the speaker amplifier and initialize the ES8311 codec via I2C0.
+    // Initialize the ES8311 codec via I2C0 (address 0x18).
     // This must happen after the I2C bus is up and the I2S clocks are running.
     if let Ok(i2c_bus) = init_i2c0_bus() {
         // PA control: the Waveshare ESP32-C6 Touch AMOLED 2.16 board config
@@ -1356,28 +1358,31 @@ pub(crate) fn init_i2s() {
             log::warn!("Failed to initialize ES8311 codec: {:?}", e);
         } else {
             kearly_println!("ES8311 codec initialized for playback");
-            let verify_result = codec.write().verify();
-            if let Err(e) = verify_result {
-                crate::drivers::audio::set_es8311_status(2);
+            if let Err(e) = codec.verify() {
                 kearly_println!("ES8311 codec verify failed: {:?}", e);
                 log::warn!("ES8311 codec verify failed: {:?}", e);
             } else {
-                crate::drivers::audio::set_es8311_status(3);
                 kearly_println!("ES8311 codec verified");
-                // Register /dev/audio_volume sharing the persisted codec handle.
-                // Failure is non-fatal — audio playback still works at init volume.
-                if let Err(e) =
-                    crate::devices::audio_volume::AudioVolumeDevice::register(codec.clone())
-                {
-                    kearly_println!("Failed to register audio volume device: {:?}", e);
-                    log::warn!("Failed to register audio volume device: {:?}", e);
-                } else {
-                    kearly_println!("Audio volume device registered as /dev/audio_volume");
+                // Wrap the codec in Arc<RwLock> and register it as
+                // /dev/audio_volume so userspace can control volume and
+                // soft-mute at runtime. The codec handle is retained for the
+                // device lifetime (previously it was dropped here, leaving no
+                // way to mute during playback start/stop).
+                let codec_arc = alloc::sync::Arc::new(
+                    blueos_infra::tinyrwlock::RwLock::new(codec),
+                );
+                match crate::devices::audio_volume::AudioVolumeDevice::register(
+                    codec_arc,
+                ) {
+                    Ok(()) => kearly_println!("audio_volume device registered"),
+                    Err(e) => {
+                        kearly_println!("Failed to register audio_volume: {:?}", e);
+                        log::warn!("Failed to register audio_volume: {:?}", e);
+                    }
                 }
             }
         }
     } else {
-        crate::drivers::audio::set_es8311_status(4);
         kearly_println!("I2C0 bus not available — skipping ES8311 init");
     }
 }

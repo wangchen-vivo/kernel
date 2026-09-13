@@ -20,7 +20,7 @@
 //! Chip select is controlled by the display bus so a single-line header and
 //! quad payload remain part of one logical transaction.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use crate::spi::{SpiBitOrder, SpiConfig, SpiPhase, SpiPolarity};
 use blueos_hal::{Configuration, PlatPeri};
@@ -52,14 +52,14 @@ const REG_SLAVE: usize = 0xe0;
 const REG_CLK_GATE: usize = 0xe8;
 
 const GDMA_MISC_CONF: usize = 0x64;
-const GDMA_OUT_INT_RAW_CH0: usize = 0x30;
-const GDMA_OUT_INT_CLR_CH0: usize = 0x3c;
-const GDMA_OUT_CONF0_CH0: usize = 0xd0;
-const GDMA_OUT_CONF1_CH0: usize = 0xd4;
-const GDMA_OUTFIFO_STATUS_CH0: usize = 0xd8;
-const GDMA_OUT_LINK_CH0: usize = 0xe0;
-const GDMA_OUT_PRI_CH0: usize = 0xfc;
-const GDMA_OUT_PERI_SEL_CH0: usize = 0x100;
+const GDMA_OUT_INT_RAW_CH1: usize = 0x40;
+const GDMA_OUT_INT_CLR_CH1: usize = 0x4c;
+const GDMA_OUT_CONF0_CH1: usize = 0x190;
+const GDMA_OUT_CONF1_CH1: usize = 0x194;
+const GDMA_OUTFIFO_STATUS_CH1: usize = 0x198;
+const GDMA_OUT_LINK_CH1: usize = 0x1a0;
+const GDMA_OUT_PRI_CH1: usize = 0x1bc;
+const GDMA_OUT_PERI_SEL_CH1: usize = 0x1c0;
 
 const CMD_UPDATE: u32 = 1 << 23;
 const CMD_USR: u32 = 1 << 24;
@@ -224,6 +224,11 @@ impl<const SPI_BASE: usize, const PCR_BASE: usize, const SOURCE_HZ: u32>
     }
 
     fn init_gdma() {
+        static INITIALIZED: AtomicBool = AtomicBool::new(false);
+        if INITIALIZED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
         unsafe {
             let conf_addr = PCR_BASE + PCR_GDMA_CONF;
             let conf = read32(conf_addr) | PCR_GDMA_CLK_EN;
@@ -367,9 +372,9 @@ impl<const SPI_BASE: usize, const PCR_BASE: usize, const SOURCE_HZ: u32>
     }
 
     fn stop_tx_dma() {
-        Self::modify_gdma_reg(GDMA_OUT_LINK_CH0, 0, GDMA_OUTLINK_STOP);
+        Self::modify_gdma_reg(GDMA_OUT_LINK_CH1, 0, GDMA_OUTLINK_STOP);
         Self::modify_reg(REG_DMA_CONF, DMA_TX_ENA, 0);
-        Self::write_gdma_reg(GDMA_OUT_INT_CLR_CH0, GDMA_OUT_ALL_INTERRUPTS);
+        Self::write_gdma_reg(GDMA_OUT_INT_CLR_CH1, GDMA_OUT_ALL_INTERRUPTS);
     }
 
     fn start_tx_dma(data: &[u8]) -> blueos_hal::err::Result<()> {
@@ -377,33 +382,33 @@ impl<const SPI_BASE: usize, const PCR_BASE: usize, const SOURCE_HZ: u32>
         let descriptor_count = Self::prepare_tx_descriptors(&mut descriptors, data);
         debug_assert!(descriptor_count > 0);
 
-        Self::write_gdma_reg(GDMA_OUT_INT_CLR_CH0, GDMA_OUT_ALL_INTERRUPTS);
-        Self::modify_gdma_reg(GDMA_OUT_CONF0_CH0, 0, GDMA_OUT_RESET);
+        Self::write_gdma_reg(GDMA_OUT_INT_CLR_CH1, GDMA_OUT_ALL_INTERRUPTS);
+        Self::modify_gdma_reg(GDMA_OUT_CONF0_CH1, 0, GDMA_OUT_RESET);
         Self::modify_gdma_reg(
-            GDMA_OUT_CONF0_CH0,
+            GDMA_OUT_CONF0_CH1,
             GDMA_OUT_RESET | GDMA_OUT_AUTO_WRITEBACK | GDMA_OUT_DATA_BURST,
             GDMA_OUT_DESCRIPTOR_BURST,
         );
-        Self::modify_gdma_reg(GDMA_OUT_CONF1_CH0, GDMA_OUT_CHECK_OWNER, 0);
-        Self::write_gdma_reg(GDMA_OUT_PRI_CH0, 0);
-        Self::write_gdma_reg(GDMA_OUT_PERI_SEL_CH0, GDMA_PERIPHERAL_SPI2);
+        Self::modify_gdma_reg(GDMA_OUT_CONF1_CH1, GDMA_OUT_CHECK_OWNER, 0);
+        Self::write_gdma_reg(GDMA_OUT_PRI_CH1, 0);
+        Self::write_gdma_reg(GDMA_OUT_PERI_SEL_CH1, GDMA_PERIPHERAL_SPI2);
 
         compiler_fence(Ordering::SeqCst);
         Self::write_gdma_reg(
-            GDMA_OUT_LINK_CH0,
+            GDMA_OUT_LINK_CH1,
             (descriptors.as_ptr() as usize as u32) & GDMA_OUTLINK_ADDRESS_MASK,
         );
         Self::modify_reg(REG_DMA_CONF, 0, DMA_TX_ENA);
-        Self::modify_gdma_reg(GDMA_OUT_LINK_CH0, 0, GDMA_OUTLINK_START);
+        Self::modify_gdma_reg(GDMA_OUT_LINK_CH1, 0, GDMA_OUTLINK_START);
 
         let mut dma_ready = false;
         for _ in 0..SPI_CMD_TIMEOUT {
-            let interrupts = Self::read_gdma_reg(GDMA_OUT_INT_RAW_CH0);
+            let interrupts = Self::read_gdma_reg(GDMA_OUT_INT_RAW_CH1);
             if interrupts & GDMA_OUT_DESCRIPTOR_ERROR != 0 {
                 Self::stop_tx_dma();
                 return Err(blueos_hal::err::HalError::Fail);
             }
-            if Self::read_gdma_reg(GDMA_OUTFIFO_STATUS_CH0) & GDMA_OUTFIFO_EMPTY == 0
+            if Self::read_gdma_reg(GDMA_OUTFIFO_STATUS_CH1) & GDMA_OUTFIFO_EMPTY == 0
                 || interrupts != 0
             {
                 dma_ready = true;
@@ -421,7 +426,7 @@ impl<const SPI_BASE: usize, const PCR_BASE: usize, const SOURCE_HZ: u32>
         let mut dma_finished = result.is_err();
         if result.is_ok() {
             for _ in 0..SPI_CMD_TIMEOUT {
-                let interrupts = Self::read_gdma_reg(GDMA_OUT_INT_RAW_CH0);
+                let interrupts = Self::read_gdma_reg(GDMA_OUT_INT_RAW_CH1);
                 if interrupts & GDMA_OUT_DESCRIPTOR_ERROR != 0 {
                     Self::stop_tx_dma();
                     return Err(blueos_hal::err::HalError::Fail);

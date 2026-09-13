@@ -38,16 +38,6 @@ use crate::devices::{
     i2c_core::block_i2c::BlockI2c,
 };
 
-/// Map a kernel `Error` (errno-style) to an `embedded_io::ErrorKind`, matching
-/// the `embedded_hal::i2c::Error::kind` mapping used in `block_i2c.rs`.
-fn error_to_io_kind(error: crate::error::Error) -> embedded_io::ErrorKind {
-    match error {
-        crate::error::code::EINVAL => embedded_io::ErrorKind::InvalidInput,
-        crate::error::code::ENOTSUP => embedded_io::ErrorKind::Unsupported,
-        _ => embedded_io::ErrorKind::Other,
-    }
-}
-
 /// ES8311 I2C slave address (7-bit, shifted left by the controller).
 const ES8311_I2C_ADDR: u8 = 0x18;
 
@@ -91,10 +81,8 @@ where
 
     /// Write a value to an ES8311 register over I2C.
     fn write_reg(&mut self, reg: u8, val: u8) -> Result<(), crate::error::Error> {
-        self.bus.transaction(
-            ES8311_I2C_ADDR,
-            &mut [embedded_hal::i2c::Operation::Write(&[reg, val])],
-        )
+        self.bus
+            .transaction(ES8311_I2C_ADDR, &mut [embedded_hal::i2c::Operation::Write(&[reg, val])])
     }
 
     /// Read a value from an ES8311 register over I2C.
@@ -309,27 +297,6 @@ where
         Ok(())
     }
 
-    /// Set the DAC playback volume (0 = mute, 255 = max).
-    pub fn set_volume(&mut self, volume: u8) -> Result<(), crate::error::Error> {
-        self.write_reg(0x32, volume)
-    }
-
-    /// Read the current DAC playback volume from register 0x32.
-    pub fn volume(&mut self) -> Result<u8, crate::error::Error> {
-        self.read_reg(0x32)
-    }
-
-    /// Mute (true) or unmute (false) the DAC output.
-    pub fn set_mute(&mut self, mute: bool) -> Result<(), crate::error::Error> {
-        let mut val = self.read_reg(0x31)?;
-        if mute {
-            val |= 0x40; // SDP_OUT_MUTE bit6
-        } else {
-            val &= !0x40;
-        }
-        self.write_reg(0x31, val)
-    }
-
     /// Verify the codec is present by reading back a few registers and
     /// checking they match the values written during `init()`.
     ///
@@ -355,14 +322,14 @@ where
                         );
                         return Err(crate::error::code::EIO);
                     }
-                    log::info!("[ES8311] reg 0x{:02X} = 0x{:02X} (OK)", reg, actual);
+                    log::info!(
+                        "[ES8311] reg 0x{:02X} = 0x{:02X} (OK)",
+                        reg,
+                        actual
+                    );
                 }
                 Err(e) => {
-                    log::warn!(
-                        "[ES8311] verify failed: cannot read reg 0x{:02X}: {:?}",
-                        reg,
-                        e
-                    );
+                    log::warn!("[ES8311] verify failed: cannot read reg 0x{:02X}: {:?}", reg, e);
                     return Err(e);
                 }
             }
@@ -371,14 +338,31 @@ where
         log::info!("[ES8311] codec verified: all register checks passed");
         Ok(())
     }
+
+    /// Soft-mute the DAC via register 0x31 (DAC_DSMMUTE bit6 / DAC_DEMMUTE
+    /// bit5). `mute=true` sets both bits (`| 0x60`), `false` clears them
+    /// (`& !0x60`), mirroring the Espressif esp-adf ES8311 driver.
+    fn dac_mute(&mut self, mute: bool) -> Result<(), crate::error::Error> {
+        self.rmw(0x31, |v| if mute { v | 0x60 } else { v & !0x60 })
+    }
 }
 
-impl<T: blueos_hal::i2c::I2c<I2cConfig, ()> + 'static> AudioVolumeOps for Es8311Driver<T> {
+impl<T, G> AudioVolumeOps for Es8311Driver<T, G>
+where
+    T: blueos_hal::i2c::I2c<I2cConfig, ()> + 'static,
+    G: blueos_hal::gpio::OutputPin + Send + Sync + 'static,
+{
     fn set_volume(&mut self, value: u8) -> Result<(), embedded_io::ErrorKind> {
-        Es8311Driver::set_volume(self, value).map_err(error_to_io_kind)
+        self.write_reg(0x32, value)
+            .map_err(|_| embedded_io::ErrorKind::Other)
     }
 
     fn volume(&mut self) -> Result<u8, embedded_io::ErrorKind> {
-        Es8311Driver::volume(self).map_err(error_to_io_kind)
+        self.read_reg(0x32).map_err(|_| embedded_io::ErrorKind::Other)
+    }
+
+    fn set_mute(&mut self, mute: bool) -> Result<(), embedded_io::ErrorKind> {
+        self.dac_mute(mute)
+            .map_err(|_| embedded_io::ErrorKind::Other)
     }
 }
