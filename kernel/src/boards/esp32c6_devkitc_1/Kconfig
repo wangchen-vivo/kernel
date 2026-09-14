@@ -66,6 +66,16 @@ config BATTERY
       and charging status through its internal fuel gauge and ADC.
       The driver exposes the result as /dev/battery.
 
+config KEYS
+    bool "Enable board keys input device"
+    default n
+    select BATTERY
+    help
+      Aggregate the board keys into /dev/keys: Key1 (PWR, AXP2101
+      PWRON short-press flag) and Key3 (GPIO18 user key, 10 kOhm
+      external pull-up, pressing ties it low). Requires the battery
+      driver (same PMU hosts the Key1 IRQ flags).
+
 config SD_CARD_SCLK_GPIO
     int "SD card SPI clock GPIO"
     default 0

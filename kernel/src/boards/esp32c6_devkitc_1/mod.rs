@@ -861,7 +861,7 @@ crate::define_bus! {
     ),
 }
 
-#[cfg(any(co5300, cst9220, sd_card, i2s))]
+#[cfg(any(co5300, cst9220, sd_card, i2s, keys))]
 crate::define_pin_states!(
     blueos_driver::pinctrl::esp32c6_pinctrl::Esp32c6IoMuxPinctrl,
     #[cfg(co5300)]
@@ -1120,9 +1120,36 @@ crate::define_pin_states!(
         false,
         false
     ),
+    // Key2 (GPIO9) and Key3 (GPIO10) are active-low user keys.
+    #[cfg(keys)]
+    (
+        9u8,        // GPIO9: Key2
+        1,          // mcu_sel = 1: plain GPIO function
+        true,       // ie = true: input enable
+        true,       // pu: keep released level high
+        false,
+        2,
+        None,       // input-only
+        None,
+        false,
+        false
+    ),
+    #[cfg(keys)]
+    (
+        10u8,       // GPIO10: Key3
+        1,
+        true,
+        true,
+        false,
+        2,
+        None,
+        None,
+        false,
+        false
+    ),
 );
 
-#[cfg(not(any(co5300, cst9220, sd_card, i2s)))]
+#[cfg(not(any(co5300, cst9220, sd_card, i2s, keys)))]
 crate::define_pin_states!(None);
 
 pub const BLOCK_STORAGE_DEVICE_NAME: &str = "sdcard-storage";
@@ -1274,6 +1301,19 @@ pub(crate) fn init_i2c_bus() {
         } else {
             kearly_println!("AXP2101 battery driver description was not found on I2C0");
             log::warn!("AXP2101 battery driver description was not found on I2C0");
+        }
+
+        #[cfg(keys)]
+        if let Ok(driver) =
+            bus.probe_driver(&crate::drivers::input::keys::KeysDriverModule::new())
+        {
+            if let Err(error) = driver.init(bus) {
+                kearly_println!("Failed to initialize keys driver: {}", error);
+                log::warn!("Failed to initialize keys driver: {}", error);
+            }
+        } else {
+            kearly_println!("keys driver description was not found on I2C0");
+            log::warn!("keys driver description was not found on I2C0");
         }
     }
 }
