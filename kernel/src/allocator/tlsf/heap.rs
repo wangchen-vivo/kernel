@@ -104,6 +104,7 @@ impl Heap {
             total: heap.total(),
             used: heap.allocated(),
             max_used: heap.maximum(),
+            max_free_block: heap.get_max_free_block_size(),
         }
     }
 

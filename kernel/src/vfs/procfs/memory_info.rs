@@ -23,7 +23,7 @@ impl ProcFileOps for MemoryInfo {
         let meminfo = allocator::memory_info();
         let available = meminfo.total - meminfo.used;
         // Pre-allocate buffer with estimated size
-        let mut result = String::with_capacity(128);
+        let mut result = String::with_capacity(160);
         writeln!(result, "{:<14}{:>8} kB", "MemTotal:", meminfo.total / 1024).unwrap();
         writeln!(result, "{:<14}{:>8} kB", "MemAvailable:", available / 1024).unwrap();
         writeln!(result, "{:<14}{:>8} kB", "MemUsed:", meminfo.used / 1024).unwrap();
@@ -32,6 +32,13 @@ impl ProcFileOps for MemoryInfo {
             "{:<14}{:>8} kB",
             "MemMaxUsed:",
             meminfo.max_used / 1024
+        )
+        .unwrap();
+        writeln!(
+            result,
+            "{:<14}{:>8} kB",
+            "MemLargestFree:",
+            meminfo.max_free_block / 1024
         )
         .unwrap();
         Ok(result.as_bytes().to_vec())

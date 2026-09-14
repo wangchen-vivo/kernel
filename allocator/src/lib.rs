@@ -29,4 +29,8 @@ pub struct MemoryInfo {
     pub total: usize,
     pub used: usize,
     pub max_used: usize,
+    /// Size of the largest contiguous free block. Diagnosing allocation
+    /// failures needs this: total free can be ample while fragmentation
+    /// still starves large allocations.
+    pub max_free_block: usize,
 }
