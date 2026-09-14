@@ -64,6 +64,22 @@ const REG_BAT_VOLTAGE_L: u8 = 0x35;
 /// Fuel-gauge battery percentage (0–100).
 const REG_BAT_PERCENT: u8 = 0xA4;
 
+/// Power-off control register. Writing 1 to bit 3 shuts the PMU down; with
+/// REG 22H.ENRESET set the PMU re-powers the board afterwards, which cold-
+/// boots the SoC — a full reset independent of the running firmware.
+const REG_PWR_OFF_CTRL: u8 = 0x10;
+const PWR_OFF_CTRL_SHUTDOWN: u8 = 1 << 3;
+
+/// PWRON long-press behavior (XPowersAXP2101.hpp REG 22H):
+/// bit1 = enable long-press power-off, bit0 = restart after power-off.
+const REG_PWRON_CTRL: u8 = 0x22;
+const PWRON_CTRL_EN_OFF: u8 = 1 << 1;
+const PWRON_CTRL_EN_RESET: u8 = 1 << 0;
+
+/// PWRON long-press duration, bits[3:2]: 00=4s 01=6s 10=8s 11=10s.
+const REG_PWRON_OFFLEVEL: u8 = 0x27;
+const OFFLEVEL_6S: u8 = 0b01;
+
 // ---------------------------------------------------------------------------
 // STATUS1 bit definitions
 // ---------------------------------------------------------------------------
@@ -175,6 +191,39 @@ impl<T: blueos_hal::i2c::I2c<I2cConfig, ()> + 'static> BatteryDevice<T> {
         Ok(buf[0])
     }
 
+    /// Write one register on the AXP2101.
+    fn write_reg(i2c: &BusWrapper<BlockI2c<T>>, reg: u8, value: u8) -> Result<(), ErrorKind> {
+        use embedded_hal::i2c::I2c;
+        let mut bus = i2c.clone();
+        bus.transaction(
+            AXP2101_I2C_ADDR,
+            &mut [embedded_hal::i2c::Operation::Write(&[reg, value])],
+        )
+        .map_err(|_| ErrorKind::Other)
+    }
+
+    /// Configure the PWRON long-press behavior: long-press (6 s) powers the
+    /// board off and the PMU re-powers it, cold-booting the SoC. This is a
+    /// hardware-level reset path that works even if the firmware is stuck.
+    fn configure_pwron_reset(i2c: &BusWrapper<BlockI2c<T>>) -> Result<(), ErrorKind> {
+        // REG 27H bits[3:2] = OFFLEVEL (6 s), preserving other bits.
+        let offlevel = Self::read_reg(i2c, REG_PWRON_OFFLEVEL)?;
+        let offlevel = (offlevel & !(0b11 << 2)) | (OFFLEVEL_6S << 2);
+        Self::write_reg(i2c, REG_PWRON_OFFLEVEL, offlevel)?;
+
+        // REG 22H: enable long-press shutdown + restart-after-off.
+        let ctrl = Self::read_reg(i2c, REG_PWRON_CTRL)?;
+        let ctrl = ctrl | PWRON_CTRL_EN_OFF | PWRON_CTRL_EN_RESET;
+        Self::write_reg(i2c, REG_PWRON_CTRL, ctrl)
+    }
+
+    /// Shut the board down through the PMU (REG 10H bit 3). The board stays
+    /// off until the PWR key is pressed (ENRESET only re-powers after a
+    /// PWRON OFFLEVEL event, not after a direct register shutdown).
+    fn pmu_poweroff(i2c: &BusWrapper<BlockI2c<T>>) -> Result<(), ErrorKind> {
+        Self::write_reg(i2c, REG_PWR_OFF_CTRL, PWR_OFF_CTRL_SHUTDOWN)
+    }
+
     /// Read the battery voltage from AXP2101 ADC registers 0x34/0x35.
     ///
     /// Mirrors `readRegisterH5L8(0x34, 0x35)` in XPowersAXP2101.tpp:2389:
@@ -259,7 +308,38 @@ impl<T: blueos_hal::i2c::I2c<I2cConfig, ()> + 'static> Device for BatteryDevice<
         Ok(BATTERY_REPORT_SIZE)
     }
 
-    fn write(&self, _pos: u64, _buf: &[u8], _is_nonblocking: bool) -> Result<usize, ErrorKind> {
+    fn write(&self, _pos: u64, buf: &[u8], _is_nonblocking: bool) -> Result<usize, ErrorKind> {
+        // Text commands, case-insensitive:
+        //   "reset"    — CPU/peripheral reset via the chip's ROM routine;
+        //                power stays on, the SoC reboots from ROM.
+        //   "poweroff" — PMU shutdown (REG 10H bit 3); the board stays off
+        //                until the PWR key is pressed.
+        fn eq_ci(a: &[u8], word: &[u8]) -> bool {
+            let trimmed: &[u8] = {
+                let s = a.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(a.len());
+                let e = a.iter().rposition(|c| !c.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(s);
+                &a[s..e]
+            };
+            trimmed.len() == word.len()
+                && trimmed.iter().zip(word).all(|(x, y)| x.eq_ignore_ascii_case(y))
+        }
+
+        if eq_ci(buf, b"reset") {
+            // The ROM routine resets the whole chip; it never returns.
+            unsafe extern "C" {
+                fn software_reset() -> !;
+            }
+            unsafe { software_reset() };
+        }
+        if eq_ci(buf, b"poweroff") {
+            let i2c = self.state.lock().i2c.clone();
+            Self::pmu_poweroff(&i2c).map_err(|_| ErrorKind::Other)?;
+            // The PMU cuts power asynchronously; keep spinning so the
+            // current call never "succeeds" into a half-dead system.
+            loop {
+                core::hint::spin_loop();
+            }
+        }
         Err(ErrorKind::Unsupported)
     }
 }
@@ -294,6 +374,13 @@ impl<T: blueos_hal::i2c::I2c<I2cConfig, ()> + 'static> InitDriver<BlockI2c<T>> f
                 chip_id
             );
             return Err(crate::error::code::ENODEV);
+        }
+
+        // PWRON long-press (6 s) = PMU power-off + auto-restart: a hardware
+        // reset path independent of the firmware. Non-fatal on failure.
+        if let Err(e) = BatteryDevice::<T>::configure_pwron_reset(&i2c) {
+            crate::kearly_println!("AXP2101: PWRON reset config failed: {:?}", e);
+            log::warn!("AXP2101: PWRON reset config failed: {:?}", e);
         }
 
         let device = Arc::new(BatteryDevice::<T>::new(i2c));
