@@ -288,10 +288,14 @@ where
         self.pa_power(ES_PA_ENABLE);
 
         // ============================================================
-        // Phase 4: Unmute & set volume (kept from original code).
-        //          Equivalent to C driver's set_mute(false) + set_vol(max).
+        // Phase 4: Set volume and leave the DAC muted.
+        //          The reference driver unmutes at max volume here, but that
+        //          leaves the speaker live from boot (PA enabled, DAC unmuted,
+        //          I2S clocks running) which hisses until the first playback
+        //          starts. Userspace (audio_volume /dev node) unmutes only when
+        //          a stream actually starts, so keep the DAC muted after init.
         // ============================================================
-        self.write_reg(0x31, 0x00)?; // unmute DAC
+        self.write_reg(0x31, 0x60)?; // mute DAC (DSM + DEM mute bits)
         self.write_reg(0x32, 0xA0)?; // volume = max
 
         Ok(())
@@ -304,9 +308,9 @@ where
     pub fn verify(&mut self) -> Result<(), crate::error::Error> {
         // Registers written during init that should retain their values.
         let checks: [RegVal; 4] = [
-            RegVal(0x09, 0x0C), // DAC SDP: I2S, 16-bit, unmuted
-            RegVal(0x0A, 0x0C), // ADC SDP: I2S, 16-bit, unmuted
-            RegVal(0x31, 0x00), // unmute DAC
+            RegVal(0x09, 0x0C), // DAC SDP: I2S, 16-bit
+            RegVal(0x0A, 0x0C), // ADC SDP: I2S, 16-bit
+            RegVal(0x31, 0x60), // DAC muted (DSM + DEM mute bits)
             RegVal(0x32, 0xA0), // volume = max
         ];
 
