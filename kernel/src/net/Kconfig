@@ -132,6 +132,18 @@ config NET_ROUTER_IP
     help
       Default router ip
 
+config HTTP_PROXY_IP
+    string "HTTP proxy ipv4 address"
+    default ""
+    help
+      IP of the plain-HTTP reverse proxy used by apps that lack DNS/TLS.
+
+config HTTP_PROXY_PORT
+    int "HTTP proxy port"
+    default 0
+    help
+      Port of the plain-HTTP reverse proxy used by apps that lack DNS/TLS.
+
 config ENABLE_WLAN
     bool "Enable wlan device"
     default n
