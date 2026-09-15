@@ -83,6 +83,11 @@ impl LlffHeap {
         heap.size_of_allocation(ptr).unwrap_or(0)
     }
 
+    /// The LLFF allocator does not support block-size histogram enumeration.
+    pub fn used_block_histogram(&self) -> Option<[usize; 6]> {
+        None
+    }
+
     pub fn get_max_free_block_size(&self) -> usize {
         let heap = self.heap.irqsave_lock();
         heap.get_max_free_block_size()

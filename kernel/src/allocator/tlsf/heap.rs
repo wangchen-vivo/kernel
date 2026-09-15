@@ -23,6 +23,9 @@ use core::{alloc::Layout, ptr::NonNull};
 /// A two-Level segregated fit heap.
 pub struct Heap {
     heap: SpinLock<TlsfHeap>,
+    /// The memory pool inserted via `init`; used to iterate blocks when
+    /// computing the used-block size histogram.
+    pool: spin::Once<NonNull<[u8]>>,
 }
 
 impl Heap {
@@ -30,6 +33,7 @@ impl Heap {
     pub const fn new() -> Self {
         Heap {
             heap: SpinLock::new(ConstDefault::DEFAULT),
+            pool: spin::Once::new(),
         }
     }
 
@@ -40,6 +44,7 @@ impl Heap {
         #[cfg(debugging_allocator)]
         debug_assert!(!heap.is_inited());
         heap.insert_free_block_ptr(block.into());
+        self.pool.call_once(|| NonNull::from(block));
     }
 
     // try to allocate memory with the given layout
@@ -119,5 +124,17 @@ impl Heap {
         #[cfg(debugging_allocator)]
         debug_assert!(heap.is_valid_ptr(ptr.as_ptr()));
         heap.size_of_allocation(ptr).unwrap_or(0)
+    }
+
+    /// Count occupied blocks by payload size bucket. Buckets:
+    /// `[<64 B, 64 B-256 B, 256 B-1 KB, 1 KB-4 KB, 4 KB-16 KB, >16 KB]`.
+    /// Returns `None` if the heap pool was never initialized.
+    pub fn used_block_histogram(&self) -> Option<[usize; 6]> {
+        let heap = self.heap.irqsave_lock();
+        let pool = self.pool.get().copied()?;
+        let mut buckets = [0usize; 6];
+        // Safety: `pool` is exactly the block inserted in `init`.
+        unsafe { heap.used_block_histogram(pool, &mut buckets) };
+        Some(buckets)
     }
 }

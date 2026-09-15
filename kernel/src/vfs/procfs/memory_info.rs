@@ -41,6 +41,12 @@ impl ProcFileOps for MemoryInfo {
             meminfo.max_free_block / 1024
         )
         .unwrap();
+        if let Some(buckets) = allocator::used_block_histogram() {
+            let labels = ["<64B", "64-256B", "256-1K", "1K-4K", "4K-16K", ">16K"];
+            for (label, count) in labels.iter().zip(buckets.iter()) {
+                writeln!(result, "{:<14}{:>8}", format!("Blk{label}:"), count).unwrap();
+            }
+        }
         Ok(result.as_bytes().to_vec())
     }
 

@@ -175,6 +175,12 @@ impl KernelAllocator {
     pub fn memory_info() -> MemoryInfo {
         HEAP.memory_info()
     }
+
+    /// Count occupied heap blocks by payload size bucket, when the underlying
+    /// allocator supports block iteration. Returns `None` otherwise.
+    pub fn used_block_histogram() -> Option<[usize; 6]> {
+        HEAP.used_block_histogram()
+    }
 }
 
 /// Initialize the kernel heap.
@@ -236,6 +242,12 @@ pub fn init_heap(start: *mut u8, end: *mut u8) {
 
 pub fn memory_info() -> MemoryInfo {
     KernelAllocator::memory_info()
+}
+
+/// Count occupied heap blocks by payload size bucket, when the underlying
+/// allocator supports block iteration. Returns `None` otherwise.
+pub fn used_block_histogram() -> Option<[usize; 6]> {
+    KernelAllocator::used_block_histogram()
 }
 
 /// Allocate memory on heap and returns a pointer to it.

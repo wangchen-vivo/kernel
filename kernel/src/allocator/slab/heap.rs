@@ -153,6 +153,12 @@ impl<
         let heap = self.heap.irqsave_lock();
         heap.get_max_free_block_size()
     }
+
+    /// The static slab allocator does not support block-size histogram
+    /// enumeration.
+    pub fn used_block_histogram(&self) -> Option<[usize; 6]> {
+        None
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -242,6 +248,12 @@ impl DynamicSlabHeap {
     pub fn get_max_free_block_size(&self) -> usize {
         let heap = self.heap.irqsave_lock();
         heap.get_max_free_block_size()
+    }
+
+    /// The dynamic slab allocator does not support block-size histogram
+    /// enumeration.
+    pub fn used_block_histogram(&self) -> Option<[usize; 6]> {
+        None
     }
 
     pub fn print_slab_stat(&self) {

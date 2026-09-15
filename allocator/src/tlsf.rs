@@ -1502,6 +1502,36 @@ impl<'pool, FLBitmap: BinInteger, SLBitmap: BinInteger, const FLLEN: usize, cons
     pub fn size_of_allocation(&self, ptr: NonNull<u8>) -> Option<usize> {
         unsafe { size_of_allocation_unknown_align(ptr) }
     }
+
+    /// Count occupied blocks by payload size bucket. Buckets are:
+    /// `[<64 B, 64 B-256 B, 256 B-1 KB, 1 KB-4 KB, 4 KB-16 KB, >16 KB]`.
+    ///
+    /// # Safety
+    ///
+    /// `pool` must precisely represent the memory pool that was inserted into
+    /// this heap (see [`Self::iter_blocks`]).
+    pub unsafe fn used_block_histogram(
+        &self,
+        pool: NonNull<[u8]>,
+        buckets: &mut [usize; 6],
+    ) {
+        *buckets = [0; 6];
+        for block in self.iter_blocks(pool) {
+            if !block.is_occupied() {
+                continue;
+            }
+            let payload = block.max_payload_size();
+            let index = match payload {
+                0..64 => 0,
+                64..256 => 1,
+                256..1024 => 2,
+                1024..4096 => 3,
+                4096..16384 => 4,
+                _ => 5,
+            };
+            buckets[index] += 1;
+        }
+    }
 }
 
 /// Allows the caller of [`Tlsf::iter_blocks`] to examine the properties of a
