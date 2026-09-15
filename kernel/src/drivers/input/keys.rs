@@ -74,13 +74,6 @@ impl KeysDevice {
 
         let mut state = self.state.lock();
         if state.last_report != Some(report) {
-            crate::kearly_println!(
-                "[KEYS] GPIO9={} GPIO10={} key2={} key3={}",
-                (!key2_held) as u8,
-                (!key3_held) as u8,
-                key2_held as u8,
-                key3_held as u8
-            );
             state.last_report = Some(report);
         }
         report
