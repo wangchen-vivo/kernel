@@ -117,6 +117,21 @@ SECTIONS {
   {
     _sdata_start = ABSOLUTE(.);
     *(.sdata .sdata.* .sdata2 .sdata2.*);
+    /* The closed-source wifi libs are relaxed by ld into GPREL accesses against their own .rodata.cst literal pools. Those pools must stay inside the __global_pointer$ window or the link fails with "relocation truncated to fit: R_RISCV_GPREL_I". Only the libs' pools (a few hundred bytes) go here; Rust objects address their own .rodata.cst via HI20/LO12 and stay in .data below. */
+    *libpp.a:(.rodata.cst*)
+    *libnet80211.a:(.rodata.cst*)
+    *libwpa_supplicant.a:(.rodata.cst*)
+    *libmesh.a:(.rodata.cst*)
+    *libprintf.a:(.rodata.cst*)
+    *libphy.a:(.rodata.cst*)
+    *libcore.a:(.rodata.cst*)
+    *libbtbb.a:(.rodata.cst*)
+    *libble_app.a:(.rodata.cst*)
+    *libcoexist.a:(.rodata.cst*)
+    *libespnow.a:(.rodata.cst*)
+    *libwapi.a:(.rodata.cst*)
+    *libsmartconfig.a:(.rodata.cst*)
+    *libregulatory.a:(.rodata.cst*)
     _sdata_end = ABSOLUTE(.);
     . = ALIGN(4);
   } > RWDATA

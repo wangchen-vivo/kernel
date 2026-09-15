@@ -624,11 +624,18 @@ impl WifiOps for Esp32WlanLink {
         };
         cfg.channel = config.channel.try_into().unwrap_or(0);
         if cfg.scan_type == wifi_scan_type_t_WIFI_SCAN_TYPE_ACTIVE {
-            // The driver default allows 120 ms on every channel. A shorter
-            // dwell keeps the single CPU responsive while still leaving enough
-            // time for nearby access points to answer an active probe.
+            // Keep a short minimum dwell for nearby APs, but allow the ESP
+            // driver default maximum so weaker APs have enough time to answer
+            // the active probe. The previous 60-ms cap produced fast but
+            // noticeably incomplete scans.
             cfg.scan_time.active.min = 20;
-            cfg.scan_time.active.max = 60;
+            cfg.scan_time.active.max = 120;
+            cfg.home_chan_dwell_time = 30;
+        } else {
+            // Listen across roughly three beacon intervals per channel. This
+            // makes full-channel discovery deterministic without using the
+            // driver's slower 360-ms passive default.
+            cfg.scan_time.passive = 300;
             cfg.home_chan_dwell_time = 30;
         }
 
