@@ -267,6 +267,18 @@ extern "C" fn handle_trap(ctx: &mut Context, mcause: usize, mtval: usize, cont: 
                 mcause,
                 mtval
             );
+            // Give the console time to flush the trap log, then restart the
+            // chip via the ROM software-reset routine instead of hanging.
+            #[cfg(target_board = "esp32c6_devkitc_1")]
+            unsafe extern "C" {
+                fn ets_delay_us(us: u32);
+                fn software_reset() -> !;
+            }
+            #[cfg(target_board = "esp32c6_devkitc_1")]
+            unsafe {
+                ets_delay_us(100_000);
+                software_reset()
+            }
             loop {
                 continue;
             }
