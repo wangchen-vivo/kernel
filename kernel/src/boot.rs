@@ -205,13 +205,30 @@ fn init_apps() {
             let stack =
                 thread::Stack::from_size(blueos_kconfig::CONFIG_MAIN_THREAD_STACK_SIZE as usize)
                     .expect("Invalid main thread stack size");
-            thread::Builder::new(thread::Entry::C(*app))
+            #[cfg(all(enable_net, any(soc_esp32c3, soc_esp32c6)))]
+            let entry = thread::Entry::Posix(
+                run_app_after_wifi_start,
+                *app as *const () as *mut core::ffi::c_void,
+            );
+            #[cfg(not(all(enable_net, any(soc_esp32c3, soc_esp32c6))))]
+            let entry = thread::Entry::C(*app);
+            thread::Builder::new(entry)
                 .set_name(b"app-main")
                 .set_stack(stack)
                 .start();
             app = app.offset(1);
         }
     }
+}
+
+#[cfg(all(enable_net, any(soc_esp32c3, soc_esp32c6)))]
+extern "C" fn run_app_after_wifi_start(app: *mut core::ffi::c_void) {
+    crate::net::link::esp32_wlan::wait_for_start_completion();
+
+    // SAFETY: `init_apps` passes entries from the linker-provided app array,
+    // whose elements all have the `extern "C" fn()` type.
+    let app: extern "C" fn() = unsafe { core::mem::transmute(app) };
+    app();
 }
 
 #[inline(never)]

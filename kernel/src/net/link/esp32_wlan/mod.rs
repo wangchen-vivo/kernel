@@ -59,17 +59,17 @@ use blueos_driver::hwinfo::esp32c6::mac as hwinfo_mac;
 use esp_wifi_sys::{
     c_types,
     include::{
-        esp_err_t, esp_interface_t_ESP_IF_WIFI_STA, esp_supplicant_init, esp_wifi_connect_internal,
-        esp_wifi_deinit_internal, esp_wifi_disconnect_internal, esp_wifi_get_mode,
-        esp_wifi_init_internal, esp_wifi_internal_free_rx_buffer, esp_wifi_internal_reg_rxcb,
-        esp_wifi_internal_tx, esp_wifi_scan_get_ap_num, esp_wifi_scan_get_ap_records,
-        esp_wifi_scan_start, esp_wifi_set_config, esp_wifi_set_country, esp_wifi_set_mode,
-        esp_wifi_set_protocols, esp_wifi_set_ps, esp_wifi_set_tx_done_cb, esp_wifi_start,
-        esp_wifi_stop, g_wifi_default_wpa_crypto_funcs, wifi_ap_record_t, wifi_auth_mode_t,
-        wifi_auth_mode_t_WIFI_AUTH_OPEN, wifi_auth_mode_t_WIFI_AUTH_WEP,
-        wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK, wifi_auth_mode_t_WIFI_AUTH_WPA2_WPA3_PSK,
-        wifi_auth_mode_t_WIFI_AUTH_WPA3_PSK, wifi_auth_mode_t_WIFI_AUTH_WPA_PSK,
-        wifi_auth_mode_t_WIFI_AUTH_WPA_WPA2_PSK, wifi_config_t,
+        esp_err_t, esp_interface_t_ESP_IF_WIFI_STA, esp_supplicant_init, esp_wifi_clear_ap_list,
+        esp_wifi_connect_internal, esp_wifi_deinit_internal, esp_wifi_disconnect_internal,
+        esp_wifi_get_mode, esp_wifi_init_internal, esp_wifi_internal_free_rx_buffer,
+        esp_wifi_internal_reg_rxcb, esp_wifi_internal_tx, esp_wifi_scan_get_ap_num,
+        esp_wifi_scan_get_ap_record, esp_wifi_scan_start, esp_wifi_set_config,
+        esp_wifi_set_country, esp_wifi_set_mode, esp_wifi_set_protocols, esp_wifi_set_ps,
+        esp_wifi_set_tx_done_cb, esp_wifi_start, esp_wifi_stop, g_wifi_default_wpa_crypto_funcs,
+        wifi_ap_record_t, wifi_auth_mode_t, wifi_auth_mode_t_WIFI_AUTH_OPEN,
+        wifi_auth_mode_t_WIFI_AUTH_WEP, wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK,
+        wifi_auth_mode_t_WIFI_AUTH_WPA2_WPA3_PSK, wifi_auth_mode_t_WIFI_AUTH_WPA3_PSK,
+        wifi_auth_mode_t_WIFI_AUTH_WPA_PSK, wifi_auth_mode_t_WIFI_AUTH_WPA_WPA2_PSK, wifi_config_t,
         wifi_country_policy_t_WIFI_COUNTRY_POLICY_MANUAL, wifi_country_t, wifi_init_config_t,
         wifi_interface_t_WIFI_IF_STA, wifi_mode_t, wifi_mode_t_WIFI_MODE_NULL,
         wifi_mode_t_WIFI_MODE_STA, wifi_osi_funcs_t, wifi_protocols_t, wifi_ps_type_t_WIFI_PS_NONE,
@@ -97,6 +97,12 @@ pub const WIFI_PROTOCOL_11AC: u32 = 32;
 pub const WIFI_PROTOCOL_11AX: u32 = 64;
 const WIFI_RX_QUEUE_SIZE: usize = 8;
 const EVENTINFO_CHANNEL_SIZE: usize = 16;
+const WIFI_START_NOT_STARTED: usize = 0;
+const WIFI_START_IN_PROGRESS: usize = 1;
+const WIFI_START_SUCCEEDED: usize = 2;
+const WIFI_START_FAILED: usize = 3;
+
+static WIFI_START_STATE: AtomicUsize = AtomicUsize::new(WIFI_START_NOT_STARTED);
 
 #[repr(transparent)]
 pub(super) struct InternalEventSender(Sender<event::EventInfo, EVENTINFO_CHANNEL_SIZE>);
@@ -221,18 +227,36 @@ impl WifiController {
     fn start(&self) -> Result<(), NetError> {
         if self
             .started
-            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             let ret = unsafe { esp_wifi_set_mode(wifi_mode_t_WIFI_MODE_STA) };
             if ret != (ESP_OK as i32) {
+                self.started.store(false, Ordering::Release);
                 return Err(NetError::DeviceNotFound(
                     "esp_wifi_set_mode failed".to_string(),
                 ));
             }
 
+            let memory = crate::allocator::memory_info();
+            log::info!(
+                "[WIFI_START] before used_bytes={} free_bytes={} largest_bytes={}",
+                memory.used,
+                memory.total.saturating_sub(memory.used),
+                memory.max_free_block
+            );
             let ret = unsafe { esp_wifi_start() };
+            let memory = crate::allocator::memory_info();
+            log::info!(
+                "[WIFI_START] after ret={} (0x{:08x}) used_bytes={} free_bytes={} largest_bytes={}",
+                ret,
+                ret as u32,
+                memory.used,
+                memory.total.saturating_sub(memory.used),
+                memory.max_free_block
+            );
             if ret != (ESP_OK as i32) {
+                self.started.store(false, Ordering::Release);
                 return Err(NetError::DeviceNotFound(
                     "esp_wifi_start failed".to_string(),
                 ));
@@ -296,12 +320,25 @@ pub struct Esp32WlanLink {
 extern "C" fn wifi_inner_init() {
     if let Err(e) = get_wlan_singleton().init() {
         log::error!("Wi-Fi API adapter initialization failed: {:?}", e);
+        WIFI_START_STATE.store(WIFI_START_FAILED, Ordering::Release);
         return;
     }
 
     if let Err(e) = get_wlan_singleton().start() {
         log::error!("Wi-Fi start failed: {:?}", e);
+        WIFI_START_STATE.store(WIFI_START_FAILED, Ordering::Release);
         return;
+    }
+
+    WIFI_START_STATE.store(WIFI_START_SUCCEEDED, Ordering::Release);
+}
+
+/// Wait until the asynchronous Wi-Fi initialization thread has finished
+/// `esp_wifi_start()`. Both success and failure release the application startup
+/// barrier so a driver error cannot deadlock application launch.
+pub(crate) fn wait_for_start_completion() {
+    while WIFI_START_STATE.load(Ordering::Acquire) < WIFI_START_SUCCEEDED {
+        scheduler::yield_me();
     }
 }
 
@@ -314,6 +351,7 @@ impl Esp32WlanLink {
         // Spawn a thread to initialize the Wi-Fi API adapter and start the Wi-Fi.
         // Becasue the Esp32 Wi-Fi adapter must be initialized in a thread context,
         // we create a dedicated thread for this purpose.
+        WIFI_START_STATE.store(WIFI_START_IN_PROGRESS, Ordering::Release);
         let wifi_init = crate::thread::build_static_thread(
             unsafe { &mut WIFI_INIT },
             unsafe { &mut WIFI_INIT_STORAGE },
@@ -324,6 +362,10 @@ impl Esp32WlanLink {
         );
         wifi_init.lock().set_name(b"wifi-init");
         let ok = scheduler::queue_ready_thread(thread::IDLE, wifi_init);
+        if ok.is_err() {
+            WIFI_START_STATE.store(WIFI_START_FAILED, Ordering::Release);
+            log::error!("Failed to queue Wi-Fi initialization thread");
+        }
         debug_assert_eq!(ok, Ok(()));
         Self {
             controller: get_wlan_singleton(),
@@ -572,90 +614,206 @@ fn wifi_scan_result_from_record(record: &wifi_ap_record_t) -> WifiScanResult {
     }
 }
 
-/// Cap the scan-result cache so a dense RF environment cannot exhaust the
-/// small heap in the ScanDone path: `esp_wifi_scan_get_ap_records` returns APs
-/// sorted by RSSI descending, so keeping the first N entries keeps the N
-/// strongest networks.
+/// Keep only a small, fixed number of results after each channel is drained.
 const MAX_CACHED_SCAN_RESULTS: usize = 8;
+const FIRST_SCAN_CHANNEL: u8 = 1;
+const LAST_SCAN_CHANNEL: u8 = 13;
 
-fn update_scan_results_from_driver(context: &str) {
+struct LowMemoryScanSession {
+    scan_type: u8,
+    current_channel: u8,
+    last_channel: u8,
+    results: Vec<WifiScanResult>,
+}
+
+impl LowMemoryScanSession {
+    fn keep_if_strong(&mut self, record: &wifi_ap_record_t) {
+        if let Some(index) = self
+            .results
+            .iter()
+            .position(|result| result.bssid == record.bssid)
+        {
+            if record.rssi > self.results[index].signal_dbm {
+                self.results[index] = wifi_scan_result_from_record(record);
+            }
+            return;
+        }
+
+        if self.results.len() < MAX_CACHED_SCAN_RESULTS {
+            self.results.push(wifi_scan_result_from_record(record));
+            return;
+        }
+
+        let weakest_index = self
+            .results
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, result)| result.signal_dbm)
+            .map(|(index, _)| index)
+            .unwrap();
+        if record.rssi > self.results[weakest_index].signal_dbm {
+            self.results[weakest_index] = wifi_scan_result_from_record(record);
+        }
+    }
+}
+
+static LOW_MEMORY_SCAN_SESSION: spin::Mutex<Option<LowMemoryScanSession>> = spin::Mutex::new(None);
+
+fn driver_scan_config(scan_type: u8, channel: u8) -> wifi_scan_config_t {
+    let mut cfg: wifi_scan_config_t = unsafe { core::mem::zeroed() };
+    cfg.scan_type = if scan_type == IW_SCAN_TYPE_ACTIVE as u8 {
+        wifi_scan_type_t_WIFI_SCAN_TYPE_ACTIVE
+    } else {
+        wifi_scan_type_t_WIFI_SCAN_TYPE_PASSIVE
+    };
+    cfg.channel = channel;
+    if cfg.scan_type == wifi_scan_type_t_WIFI_SCAN_TYPE_ACTIVE {
+        cfg.scan_time.active.min = 20;
+        cfg.scan_time.active.max = 120;
+        cfg.home_chan_dwell_time = 30;
+    } else {
+        cfg.scan_time.passive = 300;
+        cfg.home_chan_dwell_time = 30;
+    }
+    cfg
+}
+
+fn start_driver_scan_channel(scan_type: u8, channel: u8) -> esp_err_t {
+    let cfg = driver_scan_config(scan_type, channel);
+    unsafe { esp_wifi_scan_start(&cfg as *const wifi_scan_config_t, false) }
+}
+
+fn clear_driver_ap_list(context: &str) {
+    let ret = unsafe { esp_wifi_clear_ap_list() };
+    if ret != (ESP_OK as i32) {
+        log::warn!("{}: esp_wifi_clear_ap_list failed: {}", context, ret);
+    }
+}
+
+/// Drain one channel without asking the binary driver to allocate its
+/// `bss_total * sizeof(pointer)` RSSI-sorting array. Each call frees one driver
+/// AP node, while the session retains at most the strongest eight networks.
+fn drain_scan_channel_results(context: &str) -> Result<u16, ()> {
     let mut bss_total = 0u16;
     let ret = unsafe { esp_wifi_scan_get_ap_num(&mut bss_total as *mut u16) };
-    if ret != (ESP_OK as i32) || bss_total == 0 {
-        log::warn!(
-            "{}: no APs found (ret={}, count={})",
-            context,
-            ret,
-            bss_total
-        );
-        update_scan_results_cache(Vec::new());
-        return;
-    }
-
-    // Never allocate for more than the cache cap: the driver's record list
-    // is RSSI-sorted, so the truncated set keeps the strongest networks.
-    let wanted = (bss_total as usize).min(MAX_CACHED_SCAN_RESULTS) as u16;
-    let mut records: Vec<MaybeUninit<wifi_ap_record_t>> = Vec::with_capacity(wanted as usize);
-    let mut record_count = wanted;
-    let ret = unsafe {
-        esp_wifi_scan_get_ap_records(
-            &mut record_count as *mut u16,
-            records.as_mut_ptr() as *mut wifi_ap_record_t,
-        )
-    };
     if ret != (ESP_OK as i32) {
-        log::warn!(
-            "{}: failed to get AP records (ret={}, count={})",
-            context,
-            ret,
-            record_count
-        );
-        update_scan_results_cache(Vec::new());
-        return;
+        log::warn!("{}: failed to get AP count: {}", context, ret);
+        clear_driver_ap_list(context);
+        return Err(());
     }
 
-    let records = unsafe {
-        records.set_len(record_count as usize);
-        core::slice::from_raw_parts(records.as_ptr() as *const wifi_ap_record_t, records.len())
+    let mut session_guard = LOW_MEMORY_SCAN_SESSION.lock();
+    let Some(session) = session_guard.as_mut() else {
+        drop(session_guard);
+        log::warn!("{}: scan completed without an active session", context);
+        clear_driver_ap_list(context);
+        return Err(());
     };
-    let results = records.iter().map(wifi_scan_result_from_record).collect();
-    log::info!("{}: cache ready ({} networks)", context, record_count);
-    update_scan_results_cache(results);
+
+    for index in 0..bss_total {
+        let mut record = MaybeUninit::<wifi_ap_record_t>::uninit();
+        let ret = unsafe { esp_wifi_scan_get_ap_record(record.as_mut_ptr()) };
+        if ret != (ESP_OK as i32) {
+            drop(session_guard);
+            log::warn!(
+                "{}: failed to get AP record {}/{}: {}",
+                context,
+                index,
+                bss_total,
+                ret
+            );
+            clear_driver_ap_list(context);
+            return Err(());
+        }
+        session.keep_if_strong(unsafe { record.assume_init_ref() });
+    }
+    drop(session_guard);
+
+    // This is normally already empty after the loop. Keep the explicit clear
+    // as a safety net for a driver count/list mismatch and future early exits.
+    clear_driver_ap_list(context);
+    Ok(bss_total)
+}
+
+fn abort_low_memory_scan(context: &str) {
+    clear_driver_ap_list(context);
+    LOW_MEMORY_SCAN_SESSION.lock().take();
+    mark_scan_results_unavailable();
+}
+
+fn continue_low_memory_scan(context: &str) {
+    let found = match drain_scan_channel_results(context) {
+        Ok(found) => found,
+        Err(()) => {
+            LOW_MEMORY_SCAN_SESSION.lock().take();
+            mark_scan_results_unavailable();
+            return;
+        }
+    };
+
+    let continuation = {
+        let mut session = LOW_MEMORY_SCAN_SESSION.lock();
+        let Some(session_ref) = session.as_mut() else {
+            mark_scan_results_unavailable();
+            return;
+        };
+        log::info!(
+            "{}: channel {} drained ({} APs, {} retained)",
+            context,
+            session_ref.current_channel,
+            found,
+            session_ref.results.len()
+        );
+
+        if session_ref.current_channel < session_ref.last_channel {
+            session_ref.current_channel += 1;
+            Some((session_ref.scan_type, session_ref.current_channel))
+        } else {
+            let mut completed = session.take().unwrap().results;
+            completed.sort_unstable_by(|left, right| right.signal_dbm.cmp(&left.signal_dbm));
+            log::info!("{}: cache ready ({} networks)", context, completed.len());
+            update_scan_results_cache(completed);
+            None
+        }
+    };
+
+    if let Some((scan_type, channel)) = continuation {
+        let ret = start_driver_scan_channel(scan_type, channel);
+        if ret != (ESP_OK as i32) {
+            log::warn!(
+                "{}: failed to start channel {} scan: {}",
+                context,
+                channel,
+                ret
+            );
+            abort_low_memory_scan(context);
+        }
+    }
 }
 
 impl WifiOps for Esp32WlanLink {
     fn scan(&mut self, config: &WifiScanConfig) -> Result<Vec<WifiScanResult>, NetError> {
-        let mut cfg: wifi_scan_config_t = unsafe { core::mem::zeroed() };
-        cfg.scan_type = if config.scan_type == IW_SCAN_TYPE_ACTIVE as u8 {
-            wifi_scan_type_t_WIFI_SCAN_TYPE_ACTIVE
-        } else {
-            wifi_scan_type_t_WIFI_SCAN_TYPE_PASSIVE
-        };
-        cfg.channel = config.channel.try_into().unwrap_or(0);
-        if cfg.scan_type == wifi_scan_type_t_WIFI_SCAN_TYPE_ACTIVE {
-            // Keep a short minimum dwell for nearby APs, but allow the ESP
-            // driver default maximum so weaker APs have enough time to answer
-            // the active probe. The previous 60-ms cap produced fast but
-            // noticeably incomplete scans.
-            cfg.scan_time.active.min = 20;
-            cfg.scan_time.active.max = 120;
-            cfg.home_chan_dwell_time = 30;
-        } else {
-            // Listen across roughly three beacon intervals per channel. This
-            // makes full-channel discovery deterministic without using the
-            // driver's slower 360-ms passive default.
-            cfg.scan_time.passive = 300;
-            cfg.home_chan_dwell_time = 30;
-        }
-
         if !try_mark_scan_results_pending() {
             log::warn!("WiFi scan already in progress");
             return Err(NetError::WouldBlock);
         }
 
-        let ret = unsafe { esp_wifi_scan_start(&cfg as *const wifi_scan_config_t, false) };
+        let requested_channel = u8::try_from(config.channel).unwrap_or(0);
+        let (first_channel, last_channel) = if requested_channel == 0 {
+            (FIRST_SCAN_CHANNEL, LAST_SCAN_CHANNEL)
+        } else {
+            (requested_channel, requested_channel)
+        };
+        *LOW_MEMORY_SCAN_SESSION.lock() = Some(LowMemoryScanSession {
+            scan_type: config.scan_type,
+            current_channel: first_channel,
+            last_channel,
+            results: Vec::with_capacity(MAX_CACHED_SCAN_RESULTS),
+        });
+
+        let ret = start_driver_scan_channel(config.scan_type, first_channel);
         if ret != (ESP_OK as i32) {
-            mark_scan_results_unavailable();
+            abort_low_memory_scan("scan start");
             log::error!("Failed to start WiFi scan: error code {}", ret);
             Err(NetError::NoRoute)
         } else {
@@ -809,10 +967,10 @@ fn esp_api_adapter_init() -> Result<(), NetError> {
                         scan_id
                     );
                     if status == 0 {
-                        update_scan_results_from_driver("ScanDone");
+                        continue_low_memory_scan("ScanDone");
                     } else {
                         log::warn!("ScanDone: scan failed with status {}", status);
-                        mark_scan_results_unavailable();
+                        abort_low_memory_scan("ScanDone failure");
                     }
                 }
                 EventInfo::StationConnected {

@@ -169,7 +169,7 @@ static WIFI_PASSPHRASE_CACHE: spin::Mutex<Option<String>> = spin::Mutex::new(Non
 
 /// Mark scan results as pending before starting a new async scan.
 pub(crate) fn try_mark_scan_results_pending() -> bool {
-    WIFI_SCAN_CACHE_STATE
+    let started = WIFI_SCAN_CACHE_STATE
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
             if state == WIFI_SCAN_CACHE_SCANNING {
                 None
@@ -177,7 +177,13 @@ pub(crate) fn try_mark_scan_results_pending() -> bool {
                 Some(WIFI_SCAN_CACHE_SCANNING)
             }
         })
-        .is_ok()
+        .is_ok();
+    if started {
+        // Do not overlap the previous result strings/vector with the driver's
+        // allocations for the next scan on small-heap targets.
+        *WIFI_SCAN_CACHE.lock() = None;
+    }
+    started
 }
 
 /// Mark scan results as unavailable when starting the scan task fails.
