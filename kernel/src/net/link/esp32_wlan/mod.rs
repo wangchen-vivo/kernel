@@ -572,6 +572,12 @@ fn wifi_scan_result_from_record(record: &wifi_ap_record_t) -> WifiScanResult {
     }
 }
 
+/// Cap the scan-result cache so a dense RF environment cannot exhaust the
+/// small heap in the ScanDone path: `esp_wifi_scan_get_ap_records` returns APs
+/// sorted by RSSI descending, so keeping the first N entries keeps the N
+/// strongest networks.
+const MAX_CACHED_SCAN_RESULTS: usize = 8;
+
 fn update_scan_results_from_driver(context: &str) {
     let mut bss_total = 0u16;
     let ret = unsafe { esp_wifi_scan_get_ap_num(&mut bss_total as *mut u16) };
@@ -586,8 +592,11 @@ fn update_scan_results_from_driver(context: &str) {
         return;
     }
 
-    let mut records: Vec<MaybeUninit<wifi_ap_record_t>> = Vec::with_capacity(bss_total as usize);
-    let mut record_count = bss_total;
+    // Never allocate for more than the cache cap: the driver's record list
+    // is RSSI-sorted, so the truncated set keeps the strongest networks.
+    let wanted = (bss_total as usize).min(MAX_CACHED_SCAN_RESULTS) as u16;
+    let mut records: Vec<MaybeUninit<wifi_ap_record_t>> = Vec::with_capacity(wanted as usize);
+    let mut record_count = wanted;
     let ret = unsafe {
         esp_wifi_scan_get_ap_records(
             &mut record_count as *mut u16,
